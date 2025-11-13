@@ -506,9 +506,10 @@ select_user_name() {
 get_pubkey() {
     section "Configuring SSH Public Key"
 
-    if [[ -n "$SSH_PUBLIC_KEY" ]]; then
+    # Only use pre-configured key if username matches the default
+    if [[ -n "$SSH_PUBLIC_KEY" ]] && [[ "$USER_ACCOUNT_NAME" == "$DEFAULT_USERNAME" ]]; then
         if validate_ssh_key "$SSH_PUBLIC_KEY"; then
-            log "Using pre-configured SSH public key"
+            log "Using pre-configured SSH public key for $USER_ACCOUNT_NAME"
             return 0
         else
             warning "Pre-configured SSH key is invalid"
@@ -516,8 +517,14 @@ get_pubkey() {
         fi
     fi
 
+    # Clear pre-configured key if username doesn't match default
+    if [[ "$USER_ACCOUNT_NAME" != "$DEFAULT_USERNAME" ]] && [[ -n "$SSH_PUBLIC_KEY" ]]; then
+        SSH_PUBLIC_KEY=""
+        log "Username is not '$DEFAULT_USERNAME' - SSH key must be provided"
+    fi
+
     echo "Paste your SSH public key (from ~/.ssh/id_ed25519.pub or ~/.ssh/id_rsa.pub):"
-    echo "Or press ENTER to generate a new key pair on this server"
+    echo "Or press ENTER to skip (password authentication will be required)"
 
     read -rp "> " SSH_PUBLIC_KEY
 
