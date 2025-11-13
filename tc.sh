@@ -17,7 +17,7 @@ readonly DEFAULT_USERNAME="cew"
 # SAFE: SSH public keys are meant to be public - paste your public key here
 # Find your public key with: cat ~/.ssh/id_ed25519.pub (or id_rsa.pub)
 # Example: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI... user@hostname"
-SSH_PUBLIC_KEY="${SSH_PUBLIC_KEY:-}"  # Set your SSH public key here or via environment variable
+SSH_PUBLIC_KEY="${SSH_PUBLIC_KEY:-ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAACAQDLpsMrS7cda7HEeGVWV9ho6RWlSdyKnY3Q30F1A43t9wHjy1Jj1707I3p8LNqR6VlIesPdwCYcHNr7PvrvZcKS2ebaLZwFAyFJNAICrpVln1tEo+Dusi8G0HbRC3vVMOjVDXiCaSAFMMKBvqutDiYF/h0wAFaEcp9cnch2wQOHbRiv0nzjRsrJPK6P09esruX4Y57NWxTMU4Nwpsl7y02UIFeI2e8aac1kVA9G3x/e1Wob95rT2Hx75GoCMHhuL+EsYgdd86njcEtwYqpUsM7YYcnqjtAWr45sq6TB8TA3N0KELR4FRRtjL0xV/LQrPh8Ir15HRNr6yXBe3hXyaYYQ3yB5gQtrQLlNchm31S5piqARbUY/PCFlg07KXu+VjivrpMrK7/fwFzi6de9cvmVJRwDhCMAh6bSAc/9OJGybfaTX7JomSE/V/6pPeaOUSVA/6zAcNtW6+tAoR82hy3vWgsz6a3Hkw6RqzEJB6JSdOWNDtgNBTSBk4sEFNQPm2W4hoI9D2+7gG/Z+ijt1u/wfsVrezQwhpLkLHmFqpV++UJXGKpDUmUxYv1F6/G+UoqztPCl9eBY8PJeO0u8+a8J6DB1Yx+ClMypdTvgGajyOryG9q6/HsL0268l1Z29XkgueaCltIu1cOvwdOxWQwZJH/kV/rVWzxJAO3TAj9UPHTw==}"
 
 # Network Configuration
 readonly WG_PORT=51820
