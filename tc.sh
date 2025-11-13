@@ -633,10 +633,10 @@ install_packages() {
     section "Installing Required Packages"
 
     log "Updating package database..."
-    exec_cmd apt-get update || error "Failed to update package database"
+    exec_cmd apt-get update -qq || error "Failed to update package database"
 
     log "Upgrading existing packages..."
-    exec_cmd apt-get upgrade -y || warning "Some packages could not be upgraded"
+    exec_cmd apt-get upgrade -y -qq || warning "Some packages could not be upgraded"
 
     log "Installing required packages (this may take a few minutes)..."
 
