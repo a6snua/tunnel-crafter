@@ -571,6 +571,63 @@ is_package_installed() {
     dpkg -l "$1" 2>/dev/null | grep -q "^ii"
 }
 
+# Bootstrap critical tools for minimal installations
+# This must run BEFORE any network operations or DNS lookups
+bootstrap_critical_tools() {
+    log "Checking for critical tools..."
+
+    local tools_to_install=()
+    local need_update=false
+
+    # Check for curl (needed for get_public_ip)
+    if ! command -v curl &>/dev/null; then
+        log "curl not found - will install"
+        tools_to_install+=("curl")
+        need_update=true
+    fi
+
+    # Check for dig (needed for DNS lookups)
+    if ! command -v dig &>/dev/null; then
+        log "dig not found - will install dnsutils"
+        tools_to_install+=("dnsutils")
+        need_update=true
+    fi
+
+    # Check for ping (needed for network test)
+    if ! command -v ping &>/dev/null; then
+        log "ping not found - will install iputils-ping"
+        tools_to_install+=("iputils-ping")
+        need_update=true
+    fi
+
+    # Check for timeout command (part of coreutils, usually present)
+    if ! command -v timeout &>/dev/null; then
+        log "timeout not found - will install coreutils"
+        tools_to_install+=("coreutils")
+        need_update=true
+    fi
+
+    # Install missing tools if needed
+    if [[ ${#tools_to_install[@]} -gt 0 ]]; then
+        log "Installing critical tools for minimal installation: ${tools_to_install[*]}"
+
+        if [[ "$DRY_RUN" == "false" ]]; then
+            # Update package list first
+            apt-get update -qq || error "Failed to update package database for bootstrap"
+
+            # Install each tool
+            for tool in "${tools_to_install[@]}"; do
+                log "Installing $tool..."
+                apt-get install -y -qq "$tool" || error "Failed to install critical tool: $tool"
+            done
+        fi
+
+        log "Critical tools installed successfully"
+    else
+        log "All critical tools present"
+    fi
+}
+
 # Install required packages
 install_packages() {
     section "Installing Required Packages"
@@ -1550,10 +1607,14 @@ main() {
     check_os
     init_log
 
+    # Bootstrap critical tools for minimal installations
+    # This MUST run before any network operations
+    bootstrap_critical_tools
+
     # Load configuration if exists
     load_config
 
-    # Network setup
+    # Network setup (now safe to use curl, dig, ping, timeout)
     test_network
     get_public_ip
     get_host_fqdn
