@@ -113,7 +113,9 @@ init_log() {
     fi
     log "Starting VPS hardening and WireGuard setup (v2.0)"
     log "Logging to $LOG_FILE"
-    [[ "$DRY_RUN" == "true" ]] && warning "DRY RUN MODE - No changes will be made"
+    if [[ "$DRY_RUN" == "true" ]]; then
+        warning "DRY RUN MODE - No changes will be made"
+    fi
 }
 
 # Log informational message
@@ -848,7 +850,7 @@ EOF
         if [[ "$DRY_RUN" == "false" ]]; then
             # Generate strong random password
             local user_password
-            user_password=$(tr -dc 'A-Za-z0-9!@#%^&*()_+-=' </dev/urandom | head -c 20)
+            user_password=$(head -c 32 /dev/urandom | tr -dc 'A-Za-z0-9!@#%^&*()_+-=' | head -c 20)
             echo "$USER_ACCOUNT_NAME:$user_password" | chpasswd
 
             # Display password securely (not logged to file)
