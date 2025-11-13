@@ -70,7 +70,8 @@ ${GREEN}Options:${NC}
     -h, --help              Show this help message
     -c, --config FILE       Load configuration from FILE
     -d, --dry-run          Show what would be done without executing
-    --skip-netdata         Skip Netdata installation
+    --with-netdata         Install Netdata monitoring (skip prompt)
+    --skip-netdata         Skip Netdata installation (skip prompt)
     --skip-ssl             Skip SSL certificate setup
     -u, --username USER    Specify username (default: cew)
 
@@ -538,6 +539,31 @@ get_pubkey() {
     fi
 
     log "SSH public key validated successfully"
+}
+
+# Prompt for optional features
+prompt_optional_features() {
+    section "Optional Features"
+
+    # Only prompt if not already set via command line
+    if [[ "${INSTALL_NETDATA_SET:-}" != "true" ]]; then
+        echo "Netdata is a real-time system monitoring tool with a web dashboard."
+        read -rp "Install Netdata monitoring? (Y/n): " netdata_response
+
+        if [[ "${netdata_response,,}" == "n" ]]; then
+            INSTALL_NETDATA=false
+            log "Netdata installation will be skipped"
+        else
+            INSTALL_NETDATA=true
+            log "Netdata will be installed"
+        fi
+    else
+        if [[ "$INSTALL_NETDATA" == "true" ]]; then
+            log "Netdata installation: enabled (set via command line)"
+        else
+            log "Netdata installation: disabled (set via command line)"
+        fi
+    fi
 }
 
 # Install SSH public key for user (idempotent)
@@ -1585,6 +1611,12 @@ parse_arguments() {
                 ;;
             --skip-netdata)
                 INSTALL_NETDATA=false
+                INSTALL_NETDATA_SET=true
+                shift
+                ;;
+            --with-netdata)
+                INSTALL_NETDATA=true
+                INSTALL_NETDATA_SET=true
                 shift
                 ;;
             --skip-ssl)
@@ -1639,6 +1671,7 @@ main() {
     # User and SSH configuration
     select_user_name
     get_pubkey
+    prompt_optional_features
     secure_ssh
     install_user_ssh_pubkey root /root "$SSH_PUBLIC_KEY"
     install_user_ssh_pubkey "$USER_ACCOUNT_NAME" "/home/$USER_ACCOUNT_NAME" "$SSH_PUBLIC_KEY"
