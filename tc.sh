@@ -1,7 +1,7 @@
 #!/bin/bash
 # =============================================================================
-# WireGuard VPN Setup Script for Debian/Ubuntu
-# Version: 2.0
+# GemiLab Tunnel Crafter -- WireGuard VPN Setup Script for Debian/Ubuntu
+# Version: 3.0
 # Description: WireGuard VPN + System Hardening + Netdata Monitoring
 # =============================================================================
 set -euo pipefail
@@ -61,7 +61,7 @@ readonly NC='\033[0m' # No Color
 # =============================================================================
 usage() {
     cat << EOF
-${BLUE}WireGuard VPN Setup Script${NC}
+${BLUE}GemiLab Tunnel Crafter WireGuard VPN Setup Script${NC}
 
 ${GREEN}Usage:${NC}
     $0 [OPTIONS]
