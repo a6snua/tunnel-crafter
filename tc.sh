@@ -901,9 +901,27 @@ EOF
 
         # Add user to sudo group
         exec_cmd usermod -aG sudo "$USER_ACCOUNT_NAME"
-        log "User '$USER_ACCOUNT_NAME' created and added to sudo group"
+
+        # Configure passwordless sudo
+        if [[ "$DRY_RUN" == "false" ]]; then
+            echo "$USER_ACCOUNT_NAME ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/90-$USER_ACCOUNT_NAME
+            chmod 440 /etc/sudoers.d/90-$USER_ACCOUNT_NAME
+        fi
+
+        log "User '$USER_ACCOUNT_NAME' created and added to sudo group with passwordless sudo"
     else
         log "User '$USER_ACCOUNT_NAME' already exists"
+
+        # Ensure user has passwordless sudo even if already exists
+        if [[ "$DRY_RUN" == "false" ]]; then
+            if ! groups "$USER_ACCOUNT_NAME" | grep -q sudo; then
+                usermod -aG sudo "$USER_ACCOUNT_NAME"
+                log "Added existing user to sudo group"
+            fi
+            echo "$USER_ACCOUNT_NAME ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/90-$USER_ACCOUNT_NAME
+            chmod 440 /etc/sudoers.d/90-$USER_ACCOUNT_NAME
+            log "Configured passwordless sudo for existing user"
+        fi
     fi
 
     # Test SSH configuration before restarting
