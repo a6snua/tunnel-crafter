@@ -1290,11 +1290,16 @@ EOF
 configure_nginx() {
     section "Configuring Nginx Reverse Proxy"
 
-    log "Setting up Netdata authentication..."
+    # Only set up Netdata authentication if Netdata is being installed
+    if [[ "$INSTALL_NETDATA" == "true" ]]; then
+        log "Setting up Netdata authentication..."
 
-    # Create htpasswd for Netdata access
-    if [[ "$DRY_RUN" == "false" ]]; then
-        htpasswd -c /etc/nginx/.htpasswd "$USER_ACCOUNT_NAME" || error "Failed to create htpasswd file"
+        # Create htpasswd for Netdata access
+        if [[ "$DRY_RUN" == "false" ]]; then
+            htpasswd -c /etc/nginx/.htpasswd "$USER_ACCOUNT_NAME" || error "Failed to create htpasswd file"
+        fi
+    else
+        log "Skipping Netdata authentication (Netdata not installed)"
     fi
 
     log "Creating Nginx configuration..."
@@ -1305,13 +1310,22 @@ configure_nginx() {
             cp /etc/nginx/sites-available/default /etc/nginx/sites-available/default.orig
         fi
 
-        cat > /etc/nginx/sites-available/default << 'EOF'
+        # Build nginx config with conditional Netdata support
+        {
+            # Netdata upstream (only if installed)
+            if [[ "$INSTALL_NETDATA" == "true" ]]; then
+                cat << 'EOF'
 # Netdata backend
 upstream netdatabackend {
     server 127.0.0.1:19999;
     keepalive 1024;
 }
 
+EOF
+            fi
+
+            # WGDashboard upstream (always)
+            cat << 'EOF'
 # WGDashboard backend
 upstream wgdashboard {
     server 127.0.0.1:10086;
@@ -1329,6 +1343,11 @@ server {
     add_header X-Frame-Options SAMEORIGIN;
     add_header Referrer-Policy strict-origin-when-cross-origin;
 
+EOF
+
+            # Netdata location blocks (only if installed)
+            if [[ "$INSTALL_NETDATA" == "true" ]]; then
+                cat << 'EOF'
     # Netdata monitoring endpoint
     location = /netdata {
         return 301 $scheme://$host:$server_port/netdata/;
@@ -1361,6 +1380,11 @@ server {
         error_log /var/log/nginx/netdata.error.log;
     }
 
+EOF
+            fi
+
+            # WGDashboard location (always)
+            cat << 'EOF'
     # WGDashboard endpoint (root)
     location / {
         proxy_pass http://wgdashboard;
@@ -1373,6 +1397,7 @@ server {
     }
 }
 EOF
+        } > /etc/nginx/sites-available/default
     fi
 
     # Test Nginx configuration
