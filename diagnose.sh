@@ -238,9 +238,9 @@ check_wireguard_configuration() {
             fail "PostDown rules MISSING in config" "Cleanup rules not configured"
         fi
 
-        # Check for SaveConfig
+        # Check for SaveConfig (critical issue!)
         if grep -q "^SaveConfig.*true" /etc/wireguard/wg0.conf; then
-            warn "SaveConfig is enabled" "This may overwrite manual config changes"
+            fail "SaveConfig is enabled" "Will ERASE PostUp/PostDown rules on shutdown! Set to 'false' or remove this line"
         fi
 
         # Count peers
@@ -282,7 +282,13 @@ check_wireguard_service() {
     if systemctl list-unit-files | grep -q "wg-quick@wg0"; then
         pass "WireGuard service unit exists: wg-quick@wg0"
     else
-        fail "WireGuard service unit not found"
+        info "WireGuard service unit not found (may be started manually)"
+
+        # Check if interface exists anyway
+        if ip link show wg0 &>/dev/null; then
+            info "WireGuard interface exists (started manually, not via systemd)"
+            info "To manage via systemd: wg-quick down wg0 && systemctl enable --now wg-quick@wg0"
+        fi
         return
     fi
 
@@ -290,19 +296,24 @@ check_wireguard_service() {
     if systemctl is-enabled wg-quick@wg0 &>/dev/null; then
         pass "WireGuard service enabled (will start on boot)"
     else
-        warn "WireGuard service not enabled"
+        warn "WireGuard service not enabled" "Enable with: systemctl enable wg-quick@wg0"
     fi
 
     # Check if active
     if systemctl is-active --quiet wg-quick@wg0; then
         pass "WireGuard service is running"
     else
-        fail "WireGuard service is NOT running" "Run: systemctl start wg-quick@wg0"
+        # Check if interface exists (manually started)
+        if ip link show wg0 &>/dev/null; then
+            info "WireGuard interface is up (started manually, not via systemd)"
+        else
+            fail "WireGuard service is NOT running" "Run: systemctl start wg-quick@wg0"
+        fi
         return
     fi
 
     # Check service logs for errors
-    if journalctl -u wg-quick@wg0 --since "10 minutes ago" | grep -qi "error\|fail"; then
+    if journalctl -u wg-quick@wg0 --since "10 minutes ago" 2>/dev/null | grep -qi "error\|fail"; then
         warn "Errors found in service logs (last 10 minutes)"
         info "Check with: journalctl -u wg-quick@wg0 -n 50"
     else
@@ -445,22 +456,31 @@ check_nat_masquerading() {
         default_iface="UNKNOWN"
     fi
 
+    # Check if UFW is active
+    local ufw_active=false
+    if command -v ufw &>/dev/null && ufw status 2>/dev/null | grep -q "Status: active"; then
+        ufw_active=true
+        info "UFW firewall detected and active"
+    fi
+
     # Check iptables for NAT rules
     local nat_rules_found=false
+    local forward_rules_found=false
+    local forward_rules_properly_positioned=false
 
     # Check for MASQUERADE rule
-    if iptables -t nat -L POSTROUTING -v -n 2>/dev/null | grep -q "MASQUERADE.*wg0"; then
-        pass "iptables MASQUERADE rule found for wg0"
+    if iptables -t nat -L POSTROUTING -v -n 2>/dev/null | grep -q "MASQUERADE.*$default_iface"; then
+        pass "iptables MASQUERADE rule found for $default_iface"
         nat_rules_found=true
     else
-        fail "iptables MASQUERADE rule NOT found for wg0" "VPN traffic cannot reach the internet!"
+        fail "iptables MASQUERADE rule NOT found for $default_iface" "VPN traffic cannot reach the internet!"
     fi
 
     # Show current NAT table
     info "Current NAT table (POSTROUTING chain):"
     if command -v iptables &>/dev/null; then
         iptables -t nat -L POSTROUTING -v -n --line-numbers 2>/dev/null | while IFS= read -r line; do
-            if echo "$line" | grep -q "wg0\|MASQUERADE"; then
+            if echo "$line" | grep -q "MASQUERADE.*$default_iface"; then
                 echo -e "      ${GREEN}$line${NC}"
             else
                 echo -e "      $line"
@@ -472,10 +492,44 @@ check_nat_masquerading() {
     echo ""
     info "Checking FORWARD chain rules..."
 
-    if iptables -L FORWARD -v -n 2>/dev/null | grep -q "wg0"; then
-        pass "FORWARD chain rules found for wg0"
+    # Get full FORWARD chain
+    local forward_output=$(iptables -L FORWARD -v -n --line-numbers 2>/dev/null)
+
+    if echo "$forward_output" | grep -q "wg0"; then
+        forward_rules_found=true
+
+        # Check POSITION of wg0 rules relative to UFW chains
+        local wg0_line=$(echo "$forward_output" | grep -n "wg0" | head -1 | cut -d: -f1)
+        local ufw_line=$(echo "$forward_output" | grep -n "ufw-" | head -1 | cut -d: -f1)
+
+        if [[ -n "$wg0_line" ]] && [[ -n "$ufw_line" ]]; then
+            if [[ $wg0_line -lt $ufw_line ]]; then
+                pass "FORWARD chain rules for wg0 are BEFORE UFW chains (correct position)"
+                forward_rules_properly_positioned=true
+            else
+                fail "FORWARD chain rules for wg0 are AFTER UFW chains" "Rules will never be reached! Use -I instead of -A"
+            fi
+        elif [[ -n "$wg0_line" ]]; then
+            pass "FORWARD chain rules found for wg0"
+            forward_rules_properly_positioned=true
+        fi
+
+        # Show packet counts
+        local wg0_rules=$(echo "$forward_output" | grep "wg0")
+        if echo "$wg0_rules" | grep -q "^\s*[1-9]"; then
+            pass "FORWARD rules are processing packets (good sign!)"
+            echo "$wg0_rules" | while IFS= read -r line; do
+                echo -e "      ${GREEN}$line${NC}"
+            done
+        else
+            warn "FORWARD rules exist but show 0 packets" "No traffic has been forwarded yet (no clients connected?)"
+            echo "$wg0_rules" | while IFS= read -r line; do
+                echo -e "      ${YELLOW}$line${NC}"
+            done
+        fi
     else
-        warn "No specific FORWARD chain rules for wg0" "May cause issues depending on default policy"
+        fail "No specific FORWARD chain rules for wg0" "Packets will be blocked by firewall"
+        forward_rules_found=false
     fi
 
     # Check FORWARD chain default policy
@@ -483,31 +537,55 @@ check_nat_masquerading() {
     if [[ "$forward_policy" == "ACCEPT" ]]; then
         info "FORWARD chain default policy: ACCEPT"
     elif [[ "$forward_policy" == "DROP" ]]; then
-        warn "FORWARD chain default policy: DROP" "May block VPN traffic if no explicit rules exist"
+        if [[ "$forward_rules_properly_positioned" == "true" ]]; then
+            info "FORWARD chain default policy: DROP (OK - wg0 rules come first)"
+        else
+            warn "FORWARD chain default policy: DROP" "Will block VPN traffic!"
+        fi
     else
         warn "FORWARD chain default policy: $forward_policy"
     fi
 
     # Provide fix if NAT not configured
-    if [[ "$nat_rules_found" == "false" ]]; then
+    if [[ "$nat_rules_found" == "false" ]] || [[ "$forward_rules_found" == "false" ]] || [[ "$forward_rules_properly_positioned" == "false" ]]; then
         echo ""
         echo -e "${RED}╔════════════════════════════════════════════════════════════╗${NC}"
-        echo -e "${RED}║  CRITICAL: NAT/MASQUERADING NOT CONFIGURED!               ║${NC}"
+        echo -e "${RED}║  CRITICAL: NAT/MASQUERADING NOT CONFIGURED PROPERLY!     ║${NC}"
         echo -e "${RED}╚════════════════════════════════════════════════════════════╝${NC}"
         echo ""
         echo -e "${YELLOW}This is the most likely cause of your connectivity issue!${NC}"
         echo ""
+
+        if [[ "$ufw_active" == "true" ]]; then
+            echo -e "${CYAN}UFW is active - you MUST use -I (insert) instead of -A (append)${NC}"
+            echo -e "${CYAN}This places wg0 rules BEFORE UFW's DROP policy.${NC}"
+            echo ""
+        fi
+
         echo -e "${CYAN}To fix, add these lines to /etc/wireguard/wg0.conf:${NC}"
         echo ""
-        echo -e "PostUp = iptables -A FORWARD -i wg0 -j ACCEPT"
-        echo -e "PostUp = iptables -A FORWARD -o wg0 -j ACCEPT"
+
+        if [[ "$ufw_active" == "true" ]]; then
+            echo -e "${BOLD}PostUp = iptables -I FORWARD 1 -i wg0 -j ACCEPT${NC}"
+            echo -e "${BOLD}PostUp = iptables -I FORWARD 1 -o wg0 -j ACCEPT${NC}"
+        else
+            echo -e "PostUp = iptables -A FORWARD -i wg0 -j ACCEPT"
+            echo -e "PostUp = iptables -A FORWARD -o wg0 -j ACCEPT"
+        fi
+
         echo -e "PostUp = iptables -t nat -A POSTROUTING -o $default_iface -j MASQUERADE"
         echo -e "PostDown = iptables -D FORWARD -i wg0 -j ACCEPT"
         echo -e "PostDown = iptables -D FORWARD -o wg0 -j ACCEPT"
         echo -e "PostDown = iptables -t nat -D POSTROUTING -o $default_iface -j MASQUERADE"
         echo ""
         echo -e "${CYAN}Then restart WireGuard:${NC}"
-        echo -e "  systemctl restart wg-quick@wg0"
+
+        if systemctl is-active --quiet wg-quick@wg0; then
+            echo -e "  systemctl restart wg-quick@wg0"
+        else
+            echo -e "  wg-quick down wg0 (if running manually)"
+            echo -e "  wg-quick up wg0"
+        fi
         echo ""
     fi
 }
@@ -637,15 +715,58 @@ check_connectivity() {
     fi
 
     # Check WireGuard can reach internet (if interface is up)
-    if ip link show wg0 &>/dev/null; then
+    if ip link show wg0 &>/dev/null && ip link show wg0 | grep -q "state UP"; then
         local wg_ip=$(ip -4 addr show wg0 | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | head -n1)
         if [[ -n "$wg_ip" ]]; then
+            echo ""
+            info "Testing server-originated traffic from wg0 interface..."
+            info "(Note: This tests OUTPUT chain, not FORWARD chain used by clients)"
+
             # Try to ping from wg0 interface
             if ping -I wg0 -c 2 -W 3 8.8.8.8 &>/dev/null; then
-                pass "WireGuard interface can reach internet"
+                pass "Server can ping from wg0 interface"
             else
-                fail "WireGuard interface CANNOT reach internet" "Routing/NAT issue!"
+                warn "Server cannot ping from wg0 interface (not critical)"
+                info "Server-originated traffic uses OUTPUT chain, which may be restricted by UFW"
+                info "CLIENT traffic uses FORWARD chain and may still work fine"
+                info "Test with an actual VPN client to verify client routing"
             fi
+        fi
+    fi
+
+    # Check for active client connections
+    echo ""
+    info "Checking for active client connections..."
+
+    if command -v wg &>/dev/null && ip link show wg0 &>/dev/null; then
+        local peer_count=$(wg show wg0 peers 2>/dev/null | wc -l)
+
+        if [[ $peer_count -gt 0 ]]; then
+            info "Found $peer_count configured peer(s)"
+
+            # Check if any peers have recent handshakes
+            local active_peers=0
+            wg show wg0 peers | while read -r peer_pubkey; do
+                local handshake=$(wg show wg0 latest-handshakes | grep "$peer_pubkey" | awk '{print $2}')
+                if [[ -n "$handshake" ]] && [[ "$handshake" != "0" ]]; then
+                    local now=$(date +%s)
+                    local age=$((now - handshake))
+
+                    if [[ $age -lt 180 ]]; then
+                        ((active_peers++)) || true
+                    fi
+                fi
+            done
+
+            if [[ $active_peers -gt 0 ]]; then
+                pass "Active client connections detected ($active_peers peer(s))"
+                info "Check FORWARD rule packet counts to verify client traffic routing"
+            else
+                info "No active client connections (no recent handshakes)"
+                info "Connect a client device and check 'wg show wg0' for traffic stats"
+            fi
+        else
+            info "No peers configured yet"
         fi
     fi
 }
@@ -974,8 +1095,22 @@ show_summary() {
         local default_iface=$(ip -o -4 route show to default 2>/dev/null | awk '{print $5; exit}')
         [[ -z "$default_iface" ]] && default_iface="eth0"
 
-        echo -e "   ${CYAN}PostUp = iptables -A FORWARD -i wg0 -j ACCEPT${NC}"
-        echo -e "   ${CYAN}PostUp = iptables -A FORWARD -o wg0 -j ACCEPT${NC}"
+        # Check if UFW is active to determine which iptables command to use
+        local use_insert=false
+        if command -v ufw &>/dev/null && ufw status 2>/dev/null | grep -q "Status: active"; then
+            use_insert=true
+            echo -e "   ${YELLOW}NOTE: UFW is active - using -I (insert) instead of -A (append)${NC}"
+            echo ""
+        fi
+
+        if [[ "$use_insert" == "true" ]]; then
+            echo -e "   ${CYAN}PostUp = iptables -I FORWARD 1 -i wg0 -j ACCEPT${NC}"
+            echo -e "   ${CYAN}PostUp = iptables -I FORWARD 1 -o wg0 -j ACCEPT${NC}"
+        else
+            echo -e "   ${CYAN}PostUp = iptables -A FORWARD -i wg0 -j ACCEPT${NC}"
+            echo -e "   ${CYAN}PostUp = iptables -A FORWARD -o wg0 -j ACCEPT${NC}"
+        fi
+
         echo -e "   ${CYAN}PostUp = iptables -t nat -A POSTROUTING -o $default_iface -j MASQUERADE${NC}"
         echo -e "   ${CYAN}PostDown = iptables -D FORWARD -i wg0 -j ACCEPT${NC}"
         echo -e "   ${CYAN}PostDown = iptables -D FORWARD -o wg0 -j ACCEPT${NC}"
@@ -994,15 +1129,21 @@ show_summary() {
 
     # Useful commands
     echo -e "${BOLD}${BLUE}Useful Commands:${NC}"
-    echo -e "  Show WireGuard status:       ${CYAN}wg show${NC}"
+    echo -e "  Show WireGuard status:       ${CYAN}wg show wg0${NC}"
+    echo -e "  Monitor clients (real-time): ${CYAN}watch -n 1 wg show wg0${NC}"
     echo -e "  Show WireGuard config:       ${CYAN}cat /etc/wireguard/wg0.conf${NC}"
     echo -e "  Restart WireGuard:           ${CYAN}systemctl restart wg-quick@wg0${NC}"
     echo -e "  View WireGuard logs:         ${CYAN}journalctl -u wg-quick@wg0 -f${NC}"
-    echo -e "  Test VPN routing:            ${CYAN}ping -I wg0 8.8.8.8${NC}"
+    echo -e "  Show FORWARD chain:          ${CYAN}iptables -L FORWARD -v -n${NC}"
     echo -e "  Show NAT rules:              ${CYAN}iptables -t nat -L -v -n${NC}"
     echo -e "  Show firewall rules:         ${CYAN}ufw status verbose${NC}"
     echo -e "  Show routing table:          ${CYAN}ip route${NC}"
     echo ""
+
+    if [[ $FAILED_CHECKS -eq 0 ]] && [[ $WARNING_CHECKS -gt 0 ]]; then
+        echo -e "${BOLD}${YELLOW}Note:${NC} Warnings are not critical but should be reviewed."
+        echo ""
+    fi
 
     echo -e "${BOLD}Report generated: $(date)${NC}"
     echo ""
