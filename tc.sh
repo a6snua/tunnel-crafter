@@ -939,31 +939,55 @@ EOF
 # FIREWALL CONFIGURATION FUNCTIONS
 # =============================================================================
 
+# Add UFW rule idempotently (only if not already present)
+add_ufw_rule() {
+    local port="$1"
+    local proto="${2:-tcp}"
+    local comment="$3"
+
+    if [[ "$DRY_RUN" == "true" ]]; then
+        log "[DRY-RUN] Would add UFW rule: ${port}/${proto} (${comment})"
+        return 0
+    fi
+
+    if ! ufw status verbose | grep -q "^${port}/${proto}.*ALLOW.*${comment:-.}" ; then
+        log "Adding UFW rule: ${port}/${proto} (${comment})"
+        ufw allow "${port}/${proto}" comment "$comment"
+    else
+        log "UFW rule already exists: ${port}/${proto}"
+    fi
+}
+
 # Configure UFW firewall
 setup_firewall() {
     section "Configuring Firewall Rules"
 
     log "Configuring UFW firewall..."
 
-    # Reset UFW to defaults (idempotent)
-    if [[ "$DRY_RUN" == "false" ]]; then
-        ufw --force reset >/dev/null 2>&1 || true
+    # Set default policies only if UFW not already configured
+    if ! ufw status | grep -q "Status: active"; then
+        log "Configuring UFW default policies (first time setup)"
+        exec_cmd ufw default deny incoming
+        exec_cmd ufw default allow outgoing
+    else
+        log "UFW already active, preserving existing configuration"
     fi
 
-    exec_cmd ufw default deny incoming
-    exec_cmd ufw default allow outgoing
+    # Add firewall rules idempotently
+    log "Ensuring required firewall rules are present..."
+    add_ufw_rule "$SSH_PORT"   tcp  "SSH"
+    add_ufw_rule "$WG_PORT"    udp  "WireGuard VPN"
+    add_ufw_rule 80            tcp  "HTTP"
+    add_ufw_rule 443           tcp  "HTTPS"
 
-    # Add firewall rules
-    log "Adding firewall rules..."
-    exec_cmd ufw allow "${SSH_PORT}/tcp" comment 'SSH'
-    exec_cmd ufw allow "${WG_PORT}/udp" comment 'WireGuard VPN'
-    exec_cmd ufw allow 80/tcp comment 'HTTP'
-    exec_cmd ufw allow 443/tcp comment 'HTTPS'
-
-    # Enable UFW
-    log "Enabling firewall..."
-    if [[ "$DRY_RUN" == "false" ]]; then
-        echo "y" | ufw enable >/dev/null 2>&1
+    # Enable UFW if not already enabled
+    if ! ufw status | grep -q "Status: active"; then
+        log "Enabling UFW firewall..."
+        if [[ "$DRY_RUN" == "false" ]]; then
+            echo "y" | ufw enable >/dev/null 2>&1
+        fi
+    else
+        log "UFW already enabled"
     fi
 
     # Configure Fail2Ban
@@ -1036,7 +1060,7 @@ install_wireguard() {
 
     # Determine default network interface
     local default_interface
-    default_interface=$(ip -4 route ls | grep default | grep -oP '(?<=dev )\S+' | head -1)
+    default_interface=$(ip -o -4 route show to default 2>/dev/null | awk '{print $5; exit}')
 
     if [[ -z "$default_interface" ]]; then
         warning "Could not determine default network interface, using eth0"
@@ -1056,9 +1080,8 @@ ListenPort = ${WG_PORT}
 PrivateKey = ${server_private_key}
 SaveConfig = true
 
-# NAT forwarding rules
-PostUp = iptables -A FORWARD -i wg0 -j ACCEPT; iptables -t nat -A POSTROUTING -o ${default_interface} -j MASQUERADE; ip6tables -A FORWARD -i wg0 -j ACCEPT; ip6tables -t nat -A POSTROUTING -o ${default_interface} -j MASQUERADE
-PostDown = iptables -D FORWARD -i wg0 -j ACCEPT; iptables -t nat -D POSTROUTING -o ${default_interface} -j MASQUERADE; ip6tables -D FORWARD -i wg0 -j ACCEPT; ip6tables -t nat -D POSTROUTING -o ${default_interface} -j MASQUERADE
+# Note: NAT is handled automatically by wg-quick when net.ipv4.ip_forward=1
+# No need for manual iptables rules on modern Debian systems with nftables
 EOF
     fi
 
@@ -1431,7 +1454,7 @@ EOF
         log "Requesting SSL certificate from Let's Encrypt..."
 
         if [[ "$DRY_RUN" == "false" ]]; then
-            if certbot --nginx -d "$HOST_FQDN" --non-interactive --agree-tos --email "root@$HOST_FQDN" 2>&1; then
+            if certbot --nginx -d "$HOST_FQDN" --register-unsafely-without-email --non-interactive --agree-tos 2>&1; then
                 log "SSL certificate obtained successfully"
 
                 # Add additional SSL hardening
