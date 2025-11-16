@@ -1022,6 +1022,23 @@ EOF
 # FIREWALL CONFIGURATION FUNCTIONS
 # =============================================================================
 
+# Detect firewall backend
+detect_firewall_backend() {
+    local backend="unknown"
+
+    if command -v nft &>/dev/null && nft list tables 2>/dev/null | grep -q .; then
+        backend="nftables"
+    elif iptables -V 2>/dev/null | grep -q nf_tables; then
+        backend="iptables-nft"
+    elif iptables -V 2>/dev/null | grep -q legacy; then
+        backend="iptables-legacy"
+    elif command -v iptables &>/dev/null; then
+        backend="iptables"
+    fi
+
+    echo "$backend"
+}
+
 # Add UFW rule idempotently (only if not already present)
 add_ufw_rule() {
     local port="$1"
@@ -1044,6 +1061,11 @@ add_ufw_rule() {
 # Configure UFW firewall
 setup_firewall() {
     section "Configuring Firewall Rules"
+
+    # Detect and log firewall backend
+    local fw_backend
+    fw_backend=$(detect_firewall_backend)
+    log "Detected firewall backend: $fw_backend"
 
     log "Configuring UFW firewall..."
 
@@ -1111,6 +1133,79 @@ EOF
 # WIREGUARD VPN FUNCTIONS
 # =============================================================================
 
+# Check for WireGuard kernel support
+check_wireguard_support() {
+    section "Checking WireGuard Kernel Support"
+
+    log "Checking WireGuard kernel support..."
+
+    if modprobe wireguard 2>/dev/null; then
+        log "WireGuard kernel module: AVAILABLE"
+        return 0
+    fi
+
+    if [[ -f /sys/module/wireguard/version ]]; then
+        log "WireGuard kernel module: BUILT-IN"
+        return 0
+    fi
+
+    warning "WireGuard kernel module not found"
+    log "Will install via DKMS (dynamic kernel module support)"
+
+    # Install kernel headers for DKMS
+    if [[ "$DRY_RUN" == "false" ]]; then
+        log "Installing kernel headers for WireGuard DKMS..."
+        apt-get install -y "linux-headers-$(uname -r)" wireguard-dkms || warning "Could not install DKMS support"
+    fi
+}
+
+# Configure UFW for WireGuard forwarding
+configure_ufw_for_wireguard() {
+    local default_interface="$1"
+    local wg_network="$2"
+
+    log "Configuring UFW for WireGuard traffic forwarding..."
+
+    if [[ "$DRY_RUN" == "false" ]]; then
+        # Set default forward policy to ACCEPT
+        if grep -q 'DEFAULT_FORWARD_POLICY="DROP"' /etc/default/ufw 2>/dev/null; then
+            sed -i 's/DEFAULT_FORWARD_POLICY="DROP"/DEFAULT_FORWARD_POLICY="ACCEPT"/' /etc/default/ufw
+            log "UFW forward policy set to ACCEPT"
+        fi
+
+        # Add NAT rules to UFW before.rules (insert before *filter table)
+        if ! grep -q "WIREGUARD NAT RULES" /etc/ufw/before.rules 2>/dev/null; then
+            # Backup original
+            cp /etc/ufw/before.rules /etc/ufw/before.rules.backup
+
+            # Create temporary file with NAT rules
+            cat > /tmp/ufw_wg_rules << UEOF
+# START WIREGUARD NAT RULES
+*nat
+:POSTROUTING ACCEPT [0:0]
+-A POSTROUTING -s ${wg_network} -o ${default_interface} -j MASQUERADE
+COMMIT
+# END WIREGUARD NAT RULES
+
+UEOF
+
+            # Prepend to before.rules
+            cat /tmp/ufw_wg_rules /etc/ufw/before.rules > /tmp/before.rules.new
+            mv /tmp/before.rules.new /etc/ufw/before.rules
+            rm /tmp/ufw_wg_rules
+
+            log "UFW NAT rules added for WireGuard"
+        else
+            log "UFW NAT rules already configured"
+        fi
+
+        # Reload UFW to apply changes
+        ufw reload >/dev/null 2>&1 || warning "Failed to reload UFW"
+    fi
+
+    log "UFW configured for WireGuard forwarding"
+}
+
 # Install and configure WireGuard
 install_wireguard() {
     section "Installing WireGuard VPN"
@@ -1145,16 +1240,40 @@ install_wireguard() {
         fi
     fi
 
-    # Determine default network interface
+    # Determine default network interface with validation
     local default_interface
     default_interface=$(ip -o -4 route show to default 2>/dev/null | awk '{print $5; exit}')
 
     if [[ -z "$default_interface" ]]; then
-        warning "Could not determine default network interface, using eth0"
-        default_interface="eth0"
+        # Fallback: try to detect interface with public IP
+        default_interface=$(ip -o -4 addr show | grep "$PUBLIC_IP" | awk '{print $2; exit}')
+    fi
+
+    if [[ -z "$default_interface" ]]; then
+        # Last resort: list available interfaces and ask
+        warning "Could not automatically determine network interface"
+        echo "Available network interfaces:"
+        ip -o link show | awk -F': ' '{print "  " $2}'
+
+        read -rp "Enter the external network interface name (e.g., eth0, ens3, enp0s3): " default_interface
+
+        if [[ -z "$default_interface" ]]; then
+            error "Network interface is required for VPN setup"
+        fi
+
+        # Verify interface exists
+        if ! ip link show "$default_interface" &>/dev/null; then
+            error "Interface '$default_interface' does not exist"
+        fi
     fi
 
     log "Using $default_interface as external network interface"
+
+    # Store for later use
+    if [[ "$DRY_RUN" == "false" ]]; then
+        mkdir -p /root/vpn_credentials
+        echo "DEFAULT_INTERFACE=$default_interface" > /root/vpn_credentials/vpn_config.env
+    fi
 
     # Create WireGuard server configuration
     log "Creating WireGuard server configuration..."
@@ -1165,10 +1284,14 @@ install_wireguard() {
 Address = ${WG_SERVER_IP}
 ListenPort = ${WG_PORT}
 PrivateKey = ${server_private_key}
-SaveConfig = true
 
-# Note: NAT is handled automatically by wg-quick when net.ipv4.ip_forward=1
-# No need for manual iptables rules on modern Debian systems with nftables
+# Enable NAT/Masquerading for WireGuard clients
+PostUp = iptables -A FORWARD -i %i -j ACCEPT; iptables -A FORWARD -o %i -j ACCEPT; iptables -t nat -A POSTROUTING -o ${default_interface} -j MASQUERADE
+PostDown = iptables -D FORWARD -i %i -j ACCEPT; iptables -D FORWARD -o %i -j ACCEPT; iptables -D nat POSTROUTING -o ${default_interface} -j MASQUERADE
+
+# IPv6 support (optional, if IPv6 is enabled)
+PostUp = ip6tables -A FORWARD -i %i -j ACCEPT; ip6tables -A FORWARD -o %i -j ACCEPT; ip6tables -t nat -A POSTROUTING -o ${default_interface} -j MASQUERADE
+PostDown = ip6tables -D FORWARD -i %i -j ACCEPT; ip6tables -D FORWARD -o %i -j ACCEPT; ip6tables -D nat POSTROUTING -o ${default_interface} -j MASQUERADE
 EOF
     fi
 
@@ -1220,6 +1343,9 @@ EOF
         fi
     fi
 
+    # Configure UFW for WireGuard forwarding
+    configure_ufw_for_wireguard "$default_interface" "${WG_SERVER_IP%/*}/24"
+
     # Enable and start WireGuard service
     log "Enabling WireGuard service..."
     exec_cmd systemctl enable wg-quick@wg0
@@ -1236,6 +1362,43 @@ EOF
     fi
 
     log "WireGuard VPN installation completed"
+}
+
+# Verify WireGuard setup
+verify_wireguard() {
+    section "Verifying WireGuard Configuration"
+
+    if [[ "$DRY_RUN" == "true" ]]; then
+        log "Skipping verification in dry-run mode"
+        return 0
+    fi
+
+    # Check if interface is up
+    if ! ip link show wg0 &>/dev/null; then
+        error "WireGuard interface wg0 is not up"
+    fi
+
+    log "WireGuard interface: UP"
+
+    # Check if IP forwarding is enabled
+    if [[ $(cat /proc/sys/net/ipv4/ip_forward) != "1" ]]; then
+        error "IP forwarding is not enabled"
+    fi
+
+    log "IP forwarding: ENABLED"
+
+    # Check NAT rules
+    if iptables -t nat -L POSTROUTING -n | grep -q MASQUERADE; then
+        log "NAT masquerading: CONFIGURED"
+    else
+        warning "NAT masquerading not found in iptables - VPN may not work"
+    fi
+
+    # Show WireGuard status
+    log "WireGuard status:"
+    wg show wg0 || warning "Could not display WireGuard status"
+
+    log "WireGuard verification completed"
 }
 
 # =============================================================================
@@ -1847,7 +2010,9 @@ main() {
     setup_firewall
 
     # VPN installation
+    check_wireguard_support
     install_wireguard
+    verify_wireguard
     install_wgdashboard
 
     # Optional: Netdata monitoring
