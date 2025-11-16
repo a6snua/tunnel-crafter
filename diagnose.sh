@@ -1,8 +1,10 @@
 #!/bin/bash
 # =============================================================================
 # GemiLab Tunnel Crafter - WireGuard Diagnostic Script
-# Version: 1.0
+# Version: 1.1
 # Description: Comprehensive diagnostics for WireGuard VPN connectivity issues
+# Features: Auto-detects WireGuard interfaces, supports custom interface names,
+#           checks NAT/masquerading, validates iptables rules positioning
 # =============================================================================
 
 set -uo pipefail
@@ -27,6 +29,11 @@ FAILED_CHECKS=0
 WARNING_CHECKS=0
 CRITICAL_ISSUES=()
 WARNINGS=()
+
+# WireGuard interface configuration
+WG_INTERFACE=""           # Will be auto-detected or specified via command-line
+WG_INTERFACES=()          # Array of all detected WireGuard interfaces
+WG_CONFIG_FILE=""         # Will be set based on interface name
 
 # =============================================================================
 # HELPER FUNCTIONS
@@ -85,10 +92,158 @@ header() {
     echo -e "${CYAN}╔════════════════════════════════════════════════════════════╗${NC}"
     echo -e "${CYAN}║                                                            ║${NC}"
     echo -e "${CYAN}║     ${BOLD}GemiLab Tunnel Crafter - VPN Diagnostics${NC}${CYAN}           ║${NC}"
-    echo -e "${CYAN}║                    Version 1.0                             ║${NC}"
+    echo -e "${CYAN}║                    Version 1.1                             ║${NC}"
     echo -e "${CYAN}║                                                            ║${NC}"
     echo -e "${CYAN}╚════════════════════════════════════════════════════════════╝${NC}"
     echo ""
+    if [[ -n "$WG_INTERFACE" ]]; then
+        info "Checking WireGuard interface: ${BOLD}${WG_INTERFACE}${NC}"
+        echo ""
+    fi
+}
+
+# =============================================================================
+# WIREGUARD INTERFACE DETECTION
+# =============================================================================
+
+# Detect all WireGuard interfaces on the system
+detect_wireguard_interfaces() {
+    local detected_interfaces=()
+
+    # Method 1: Check for interfaces using 'ip link' (most reliable)
+    while IFS= read -r iface; do
+        detected_interfaces+=("$iface")
+    done < <(ip -o link show type wireguard 2>/dev/null | awk -F': ' '{print $2}' | awk '{print $1}')
+
+    # Method 2: Check for running wg interfaces via 'wg show interfaces'
+    if command -v wg &>/dev/null; then
+        local wg_interfaces
+        wg_interfaces=$(wg show interfaces 2>/dev/null)
+        if [[ -n "$wg_interfaces" ]]; then
+            for iface in $wg_interfaces; do
+                # Add if not already in array
+                if [[ ! " ${detected_interfaces[*]} " =~ " ${iface} " ]]; then
+                    detected_interfaces+=("$iface")
+                fi
+            done
+        fi
+    fi
+
+    # Method 3: Check for config files in /etc/wireguard/
+    if [[ -d /etc/wireguard ]]; then
+        for conf_file in /etc/wireguard/*.conf; do
+            if [[ -f "$conf_file" ]]; then
+                local iface_name=$(basename "$conf_file" .conf)
+                # Add if not already in array and if interface exists
+                if [[ ! " ${detected_interfaces[*]} " =~ " ${iface_name} " ]]; then
+                    # Only add if interface actually exists or config exists
+                    if ip link show "$iface_name" &>/dev/null || [[ -f "/etc/wireguard/${iface_name}.conf" ]]; then
+                        detected_interfaces+=("$iface_name")
+                    fi
+                fi
+            fi
+        done
+    fi
+
+    WG_INTERFACES=("${detected_interfaces[@]}")
+}
+
+# Select WireGuard interface to check
+select_wireguard_interface() {
+    # If interface specified via command-line, use it
+    if [[ -n "$WG_INTERFACE" ]]; then
+        info "Using specified WireGuard interface: $WG_INTERFACE"
+        WG_CONFIG_FILE="/etc/wireguard/${WG_INTERFACE}.conf"
+        return 0
+    fi
+
+    # Detect all interfaces
+    detect_wireguard_interfaces
+
+    # If no interfaces found
+    if [[ ${#WG_INTERFACES[@]} -eq 0 ]]; then
+        warn "No WireGuard interfaces detected"
+        info "Defaulting to 'wg0' for config file checks"
+        WG_INTERFACE="wg0"
+        WG_CONFIG_FILE="$WG_CONFIG_FILE"
+        return 1
+    fi
+
+    # If only one interface found, use it
+    if [[ ${#WG_INTERFACES[@]} -eq 1 ]]; then
+        WG_INTERFACE="${WG_INTERFACES[0]}"
+        WG_CONFIG_FILE="/etc/wireguard/${WG_INTERFACE}.conf"
+        info "Auto-detected WireGuard interface: $WG_INTERFACE"
+        return 0
+    fi
+
+    # Multiple interfaces found - use the first one, but notify user
+    WG_INTERFACE="${WG_INTERFACES[0]}"
+    WG_CONFIG_FILE="/etc/wireguard/${WG_INTERFACE}.conf"
+    info "Multiple WireGuard interfaces detected: ${WG_INTERFACES[*]}"
+    info "Checking primary interface: $WG_INTERFACE"
+    info "To check a specific interface, run: $0 -i <interface>"
+    return 0
+}
+
+# =============================================================================
+# COMMAND-LINE ARGUMENT PARSING
+# =============================================================================
+
+usage() {
+    cat << EOF
+${BOLD}GemiLab Tunnel Crafter - WireGuard VPN Diagnostics${NC}
+
+${GREEN}Usage:${NC}
+    $0 [OPTIONS]
+
+${GREEN}Options:${NC}
+    -h, --help              Show this help message
+    -i, --interface NAME    Check specific WireGuard interface (default: auto-detect)
+    -a, --all              Check all detected WireGuard interfaces
+
+${GREEN}Examples:${NC}
+    # Auto-detect and check WireGuard interface
+    sudo $0
+
+    # Check specific interface
+    sudo $0 -i wg0
+    sudo $0 -i wg-vpn
+
+    # Check all interfaces
+    sudo $0 --all
+
+${YELLOW}Note:${NC} This script must be run as root.
+
+EOF
+    exit 0
+}
+
+parse_arguments() {
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            -h|--help)
+                usage
+                ;;
+            -i|--interface)
+                if [[ -z "${2:-}" ]]; then
+                    echo -e "${RED}Error: --interface requires an argument${NC}" >&2
+                    exit 1
+                fi
+                WG_INTERFACE="$2"
+                shift 2
+                ;;
+            -a|--all)
+                echo -e "${YELLOW}Checking all WireGuard interfaces is not yet implemented${NC}"
+                echo -e "${YELLOW}Defaulting to primary interface${NC}"
+                shift
+                ;;
+            *)
+                echo -e "${RED}Unknown option: $1${NC}" >&2
+                usage
+                ;;
+        esac
+    done
 }
 
 # =============================================================================
@@ -188,11 +343,11 @@ check_wireguard_configuration() {
     fi
 
     # Check for wg0.conf
-    if [[ -f /etc/wireguard/wg0.conf ]]; then
-        pass "WireGuard config exists: /etc/wireguard/wg0.conf"
+    if [[ -f $WG_CONFIG_FILE ]]; then
+        pass "WireGuard config exists: $WG_CONFIG_FILE"
 
         # Check permissions
-        local perms=$(stat -c "%a" /etc/wireguard/wg0.conf)
+        local perms=$(stat -c "%a" $WG_CONFIG_FILE)
         if [[ "$perms" == "600" ]]; then
             pass "WireGuard config permissions correct (600)"
         else
@@ -200,51 +355,51 @@ check_wireguard_configuration() {
         fi
 
         # Check for required fields
-        if grep -q "^PrivateKey" /etc/wireguard/wg0.conf; then
+        if grep -q "^PrivateKey" $WG_CONFIG_FILE; then
             pass "PrivateKey present in config"
         else
             fail "PrivateKey missing in config"
         fi
 
-        if grep -q "^ListenPort" /etc/wireguard/wg0.conf; then
+        if grep -q "^ListenPort" $WG_CONFIG_FILE; then
             pass "ListenPort present in config"
-            local port=$(grep "^ListenPort" /etc/wireguard/wg0.conf | awk '{print $3}')
+            local port=$(grep "^ListenPort" $WG_CONFIG_FILE | awk '{print $3}')
             info "WireGuard listening on port: $port"
         else
             warn "ListenPort not specified in config"
         fi
 
-        if grep -q "^Address" /etc/wireguard/wg0.conf; then
+        if grep -q "^Address" $WG_CONFIG_FILE; then
             pass "Address present in config"
-            local addr=$(grep "^Address" /etc/wireguard/wg0.conf | awk '{print $3}')
+            local addr=$(grep "^Address" $WG_CONFIG_FILE | awk '{print $3}')
             info "WireGuard server address: $addr"
         else
             fail "Address missing in config"
         fi
 
         # CRITICAL: Check for PostUp/PostDown rules (NAT configuration)
-        if grep -q "^PostUp" /etc/wireguard/wg0.conf; then
+        if grep -q "^PostUp" $WG_CONFIG_FILE; then
             pass "PostUp rules present in config"
-            grep "^PostUp" /etc/wireguard/wg0.conf | while read -r line; do
+            grep "^PostUp" $WG_CONFIG_FILE | while read -r line; do
                 info "  $line"
             done
         else
             fail "PostUp rules MISSING in config" "NAT/masquerading not configured - this is why traffic doesn't work!"
         fi
 
-        if grep -q "^PostDown" /etc/wireguard/wg0.conf; then
+        if grep -q "^PostDown" $WG_CONFIG_FILE; then
             pass "PostDown rules present in config"
         else
             fail "PostDown rules MISSING in config" "Cleanup rules not configured"
         fi
 
         # Check for SaveConfig (critical issue!)
-        if grep -q "^SaveConfig.*true" /etc/wireguard/wg0.conf; then
+        if grep -q "^SaveConfig.*true" $WG_CONFIG_FILE; then
             fail "SaveConfig is enabled" "Will ERASE PostUp/PostDown rules on shutdown! Set to 'false' or remove this line"
         fi
 
         # Count peers
-        local peer_count=$(grep -c "^\[Peer\]" /etc/wireguard/wg0.conf)
+        local peer_count=$(grep -c "^\[Peer\]" $WG_CONFIG_FILE)
         if [[ $peer_count -gt 0 ]]; then
             pass "Peer configurations found: $peer_count peer(s)"
         else
@@ -252,7 +407,7 @@ check_wireguard_configuration() {
         fi
 
     else
-        fail "WireGuard config missing: /etc/wireguard/wg0.conf"
+        fail "WireGuard config missing: $WG_CONFIG_FILE"
     fi
 
     # Check for keys
@@ -279,43 +434,43 @@ check_wireguard_service() {
     section "WireGuard Service Status"
 
     # Check if service exists
-    if systemctl list-unit-files | grep -q "wg-quick@wg0"; then
-        pass "WireGuard service unit exists: wg-quick@wg0"
+    if systemctl list-unit-files | grep -q "wg-quick@$WG_INTERFACE"; then
+        pass "WireGuard service unit exists: wg-quick@$WG_INTERFACE"
     else
         info "WireGuard service unit not found (may be started manually)"
 
         # Check if interface exists anyway
-        if ip link show wg0 &>/dev/null; then
+        if ip link show $WG_INTERFACE &>/dev/null; then
             info "WireGuard interface exists (started manually, not via systemd)"
-            info "To manage via systemd: wg-quick down wg0 && systemctl enable --now wg-quick@wg0"
+            info "To manage via systemd: wg-quick down $WG_INTERFACE && systemctl enable --now wg-quick@$WG_INTERFACE"
         fi
         return
     fi
 
     # Check if enabled
-    if systemctl is-enabled wg-quick@wg0 &>/dev/null; then
+    if systemctl is-enabled wg-quick@$WG_INTERFACE &>/dev/null; then
         pass "WireGuard service enabled (will start on boot)"
     else
-        warn "WireGuard service not enabled" "Enable with: systemctl enable wg-quick@wg0"
+        warn "WireGuard service not enabled" "Enable with: systemctl enable wg-quick@$WG_INTERFACE"
     fi
 
     # Check if active
-    if systemctl is-active --quiet wg-quick@wg0; then
+    if systemctl is-active --quiet wg-quick@$WG_INTERFACE; then
         pass "WireGuard service is running"
     else
         # Check if interface exists (manually started)
-        if ip link show wg0 &>/dev/null; then
+        if ip link show $WG_INTERFACE &>/dev/null; then
             info "WireGuard interface is up (started manually, not via systemd)"
         else
-            fail "WireGuard service is NOT running" "Run: systemctl start wg-quick@wg0"
+            fail "WireGuard service is NOT running" "Run: systemctl start wg-quick@$WG_INTERFACE"
         fi
         return
     fi
 
     # Check service logs for errors
-    if journalctl -u wg-quick@wg0 --since "10 minutes ago" 2>/dev/null | grep -qi "error\|fail"; then
+    if journalctl -u wg-quick@$WG_INTERFACE --since "10 minutes ago" 2>/dev/null | grep -qi "error\|fail"; then
         warn "Errors found in service logs (last 10 minutes)"
-        info "Check with: journalctl -u wg-quick@wg0 -n 50"
+        info "Check with: journalctl -u wg-quick@$WG_INTERFACE -n 50"
     else
         pass "No recent errors in service logs"
     fi
@@ -325,18 +480,18 @@ check_wireguard_interface() {
     section "WireGuard Interface Status"
 
     # Check if wg0 interface exists
-    if ip link show wg0 &>/dev/null; then
-        pass "WireGuard interface 'wg0' exists"
+    if ip link show $WG_INTERFACE &>/dev/null; then
+        pass "WireGuard interface '$WG_INTERFACE' exists"
 
         # Check if interface is up
-        if ip link show wg0 | grep -q "state UP"; then
+        if ip link show $WG_INTERFACE | grep -q "state UP"; then
             pass "WireGuard interface is UP"
         else
-            fail "WireGuard interface is DOWN" "Run: wg-quick up wg0"
+            fail "WireGuard interface is DOWN" "Run: wg-quick up $WG_INTERFACE"
         fi
 
         # Check interface IP address
-        local wg_ip=$(ip -4 addr show wg0 2>/dev/null | grep -oP '(?<=inet\s)\d+(\.\d+){3}/\d+' | head -n1)
+        local wg_ip=$(ip -4 addr show $WG_INTERFACE 2>/dev/null | grep -oP '(?<=inet\s)\d+(\.\d+){3}/\d+' | head -n1)
         if [[ -n "$wg_ip" ]]; then
             pass "WireGuard interface has IP: $wg_ip"
         else
@@ -344,33 +499,33 @@ check_wireguard_interface() {
         fi
 
     else
-        fail "WireGuard interface 'wg0' does NOT exist" "WireGuard is not running"
+        fail "WireGuard interface '$WG_INTERFACE' does NOT exist" "WireGuard is not running"
         return
     fi
 
     # Check WireGuard status with wg command
-    if wg show wg0 &>/dev/null; then
+    if wg show $WG_INTERFACE &>/dev/null; then
         pass "WireGuard interface status available"
 
         # Get listening port
-        local listen_port=$(wg show wg0 listen-port 2>/dev/null)
+        local listen_port=$(wg show $WG_INTERFACE listen-port 2>/dev/null)
         if [[ -n "$listen_port" ]]; then
             info "Listening port: $listen_port"
         fi
 
         # Get peer count
-        local peer_count=$(wg show wg0 peers 2>/dev/null | wc -l)
+        local peer_count=$(wg show $WG_INTERFACE peers 2>/dev/null | wc -l)
         info "Connected peers: $peer_count"
 
         # Check each peer
         if [[ $peer_count -gt 0 ]]; then
             echo ""
             info "Peer Details:"
-            wg show wg0 peers | while read -r peer_pubkey; do
+            wg show $WG_INTERFACE peers | while read -r peer_pubkey; do
                 echo -e "${CYAN}    Peer: ${peer_pubkey:0:20}...${NC}"
 
                 # Get peer endpoint
-                local endpoint=$(wg show wg0 endpoints | grep "$peer_pubkey" | awk '{print $2}')
+                local endpoint=$(wg show $WG_INTERFACE endpoints | grep "$peer_pubkey" | awk '{print $2}')
                 if [[ -n "$endpoint" ]]; then
                     echo -e "      Endpoint: $endpoint"
                 else
@@ -378,7 +533,7 @@ check_wireguard_interface() {
                 fi
 
                 # Get latest handshake
-                local handshake=$(wg show wg0 latest-handshakes | grep "$peer_pubkey" | awk '{print $2}')
+                local handshake=$(wg show $WG_INTERFACE latest-handshakes | grep "$peer_pubkey" | awk '{print $2}')
                 if [[ -n "$handshake" ]] && [[ "$handshake" != "0" ]]; then
                     local now=$(date +%s)
                     local age=$((now - handshake))
@@ -393,7 +548,7 @@ check_wireguard_interface() {
                 fi
 
                 # Get transfer
-                local transfer=$(wg show wg0 transfer | grep "$peer_pubkey")
+                local transfer=$(wg show $WG_INTERFACE transfer | grep "$peer_pubkey")
                 local rx=$(echo "$transfer" | awk '{print $2}')
                 local tx=$(echo "$transfer" | awk '{print $3}')
 
@@ -409,7 +564,7 @@ check_wireguard_interface() {
                 fi
 
                 # Get allowed IPs
-                local allowed=$(wg show wg0 allowed-ips | grep "$peer_pubkey" | cut -d$'\t' -f2-)
+                local allowed=$(wg show $WG_INTERFACE allowed-ips | grep "$peer_pubkey" | cut -d$'\t' -f2-)
                 if [[ -n "$allowed" ]]; then
                     echo -e "      Allowed IPs: $allowed"
                 fi
@@ -495,7 +650,7 @@ check_nat_masquerading() {
     # Get full FORWARD chain
     local forward_output=$(iptables -L FORWARD -v -n --line-numbers 2>/dev/null)
 
-    if echo "$forward_output" | grep -q "wg0"; then
+    if echo "$forward_output" | grep -q "$WG_INTERFACE"; then
         forward_rules_found=true
 
         # Check POSITION of wg0 rules relative to UFW chains
@@ -515,7 +670,7 @@ check_nat_masquerading() {
         fi
 
         # Show packet counts
-        local wg0_rules=$(echo "$forward_output" | grep "wg0")
+        local wg0_rules=$(echo "$forward_output" | grep "$WG_INTERFACE")
         if echo "$wg0_rules" | grep -q "^\s*[1-9]"; then
             pass "FORWARD rules are processing packets (good sign!)"
             echo "$wg0_rules" | while IFS= read -r line; do
@@ -562,7 +717,7 @@ check_nat_masquerading() {
             echo ""
         fi
 
-        echo -e "${CYAN}To fix, add these lines to /etc/wireguard/wg0.conf:${NC}"
+        echo -e "${CYAN}To fix, add these lines to $WG_CONFIG_FILE:${NC}"
         echo ""
 
         if [[ "$ufw_active" == "true" ]]; then
@@ -580,11 +735,11 @@ check_nat_masquerading() {
         echo ""
         echo -e "${CYAN}Then restart WireGuard:${NC}"
 
-        if systemctl is-active --quiet wg-quick@wg0; then
-            echo -e "  systemctl restart wg-quick@wg0"
+        if systemctl is-active --quiet wg-quick@$WG_INTERFACE; then
+            echo -e "  systemctl restart wg-quick@$WG_INTERFACE"
         else
-            echo -e "  wg-quick down wg0 (if running manually)"
-            echo -e "  wg-quick up wg0"
+            echo -e "  wg-quick down $WG_INTERFACE (if running manually)"
+            echo -e "  wg-quick up $WG_INTERFACE"
         fi
         echo ""
     fi
@@ -610,7 +765,7 @@ check_firewall() {
     fi
 
     # Check WireGuard port
-    local wg_port=$(grep "^ListenPort" /etc/wireguard/wg0.conf 2>/dev/null | awk '{print $3}')
+    local wg_port=$(grep "^ListenPort" $WG_CONFIG_FILE 2>/dev/null | awk '{print $3}')
     if [[ -n "$wg_port" ]]; then
         if ufw status | grep -q "${wg_port}/udp.*ALLOW"; then
             pass "UFW allows WireGuard port ${wg_port}/udp"
@@ -656,9 +811,9 @@ check_routing() {
     fi
 
     # Check WireGuard routes
-    if ip -4 route | grep -q "wg0"; then
+    if ip -4 route | grep -q "$WG_INTERFACE"; then
         pass "Routes exist for wg0 interface"
-        ip -4 route | grep "wg0" | while IFS= read -r line; do
+        ip -4 route | grep "$WG_INTERFACE" | while IFS= read -r line; do
             info "  $line"
         done
     else
@@ -715,15 +870,15 @@ check_connectivity() {
     fi
 
     # Check WireGuard can reach internet (if interface is up)
-    if ip link show wg0 &>/dev/null && ip link show wg0 | grep -q "state UP"; then
-        local wg_ip=$(ip -4 addr show wg0 | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | head -n1)
+    if ip link show $WG_INTERFACE &>/dev/null && ip link show $WG_INTERFACE | grep -q "state UP"; then
+        local wg_ip=$(ip -4 addr show $WG_INTERFACE | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | head -n1)
         if [[ -n "$wg_ip" ]]; then
             echo ""
             info "Testing server-originated traffic from wg0 interface..."
             info "(Note: This tests OUTPUT chain, not FORWARD chain used by clients)"
 
             # Try to ping from wg0 interface
-            if ping -I wg0 -c 2 -W 3 8.8.8.8 &>/dev/null; then
+            if ping -I $WG_INTERFACE -c 2 -W 3 8.8.8.8 &>/dev/null; then
                 pass "Server can ping from wg0 interface"
             else
                 warn "Server cannot ping from wg0 interface (not critical)"
@@ -738,16 +893,16 @@ check_connectivity() {
     echo ""
     info "Checking for active client connections..."
 
-    if command -v wg &>/dev/null && ip link show wg0 &>/dev/null; then
-        local peer_count=$(wg show wg0 peers 2>/dev/null | wc -l)
+    if command -v wg &>/dev/null && ip link show $WG_INTERFACE &>/dev/null; then
+        local peer_count=$(wg show $WG_INTERFACE peers 2>/dev/null | wc -l)
 
         if [[ $peer_count -gt 0 ]]; then
             info "Found $peer_count configured peer(s)"
 
             # Check if any peers have recent handshakes
             local active_peers=0
-            wg show wg0 peers | while read -r peer_pubkey; do
-                local handshake=$(wg show wg0 latest-handshakes | grep "$peer_pubkey" | awk '{print $2}')
+            wg show $WG_INTERFACE peers | while read -r peer_pubkey; do
+                local handshake=$(wg show $WG_INTERFACE latest-handshakes | grep "$peer_pubkey" | awk '{print $2}')
                 if [[ -n "$handshake" ]] && [[ "$handshake" != "0" ]]; then
                     local now=$(date +%s)
                     local age=$((now - handshake))
@@ -763,7 +918,7 @@ check_connectivity() {
                 info "Check FORWARD rule packet counts to verify client traffic routing"
             else
                 info "No active client connections (no recent handshakes)"
-                info "Connect a client device and check 'wg show wg0' for traffic stats"
+                info "Connect a client device and check 'wg show $WG_INTERFACE' for traffic stats"
             fi
         else
             info "No peers configured yet"
@@ -1006,10 +1161,10 @@ check_logs() {
     info "Checking for errors in system logs (last 1 hour)..."
 
     # WireGuard errors
-    local wg_errors=$(journalctl -u wg-quick@wg0 --since "1 hour ago" 2>/dev/null | grep -i "error\|fail" | wc -l)
+    local wg_errors=$(journalctl -u wg-quick@$WG_INTERFACE --since "1 hour ago" 2>/dev/null | grep -i "error\|fail" | wc -l)
     if [[ $wg_errors -gt 0 ]]; then
         warn "Found $wg_errors error(s) in WireGuard logs"
-        info "View with: journalctl -u wg-quick@wg0 -n 50"
+        info "View with: journalctl -u wg-quick@$WG_INTERFACE -n 50"
     else
         pass "No errors in WireGuard logs"
     fi
@@ -1086,10 +1241,10 @@ show_summary() {
     echo ""
 
     # Check for the most common issue
-    if ! grep -q "^PostUp" /etc/wireguard/wg0.conf 2>/dev/null; then
+    if ! grep -q "^PostUp" $WG_CONFIG_FILE 2>/dev/null; then
         echo -e "${RED}1. FIX NAT/MASQUERADING (CRITICAL):${NC}"
         echo -e "   Your WireGuard config is missing NAT rules. This is why clients"
-        echo -e "   can connect but have no traffic. Add these lines to /etc/wireguard/wg0.conf:"
+        echo -e "   can connect but have no traffic. Add these lines to $WG_CONFIG_FILE:"
         echo ""
 
         local default_iface=$(ip -o -4 route show to default 2>/dev/null | awk '{print $5; exit}')
@@ -1116,24 +1271,24 @@ show_summary() {
         echo -e "   ${CYAN}PostDown = iptables -D FORWARD -o wg0 -j ACCEPT${NC}"
         echo -e "   ${CYAN}PostDown = iptables -t nat -D POSTROUTING -o $default_iface -j MASQUERADE${NC}"
         echo ""
-        echo -e "   Then restart WireGuard: ${CYAN}systemctl restart wg-quick@wg0${NC}"
+        echo -e "   Then restart WireGuard: ${CYAN}systemctl restart wg-quick@$WG_INTERFACE${NC}"
         echo ""
     fi
 
     if [[ $FAILED_CHECKS -gt 0 ]] || [[ $WARNING_CHECKS -gt 0 ]]; then
         echo -e "2. Review all failed checks and warnings above"
-        echo -e "3. Check service logs: ${CYAN}journalctl -u wg-quick@wg0 -n 100${NC}"
-        echo -e "4. Test connectivity after fixes: ${CYAN}ping -I wg0 8.8.8.8${NC}"
+        echo -e "3. Check service logs: ${CYAN}journalctl -u wg-quick@$WG_INTERFACE -n 100${NC}"
+        echo -e "4. Test connectivity after fixes: ${CYAN}ping -I $WG_INTERFACE 8.8.8.8${NC}"
         echo ""
     fi
 
     # Useful commands
     echo -e "${BOLD}${BLUE}Useful Commands:${NC}"
-    echo -e "  Show WireGuard status:       ${CYAN}wg show wg0${NC}"
-    echo -e "  Monitor clients (real-time): ${CYAN}watch -n 1 wg show wg0${NC}"
-    echo -e "  Show WireGuard config:       ${CYAN}cat /etc/wireguard/wg0.conf${NC}"
-    echo -e "  Restart WireGuard:           ${CYAN}systemctl restart wg-quick@wg0${NC}"
-    echo -e "  View WireGuard logs:         ${CYAN}journalctl -u wg-quick@wg0 -f${NC}"
+    echo -e "  Show WireGuard status:       ${CYAN}wg show $WG_INTERFACE${NC}"
+    echo -e "  Monitor clients (real-time): ${CYAN}watch -n 1 wg show $WG_INTERFACE${NC}"
+    echo -e "  Show WireGuard config:       ${CYAN}cat $WG_CONFIG_FILE${NC}"
+    echo -e "  Restart WireGuard:           ${CYAN}systemctl restart wg-quick@$WG_INTERFACE${NC}"
+    echo -e "  View WireGuard logs:         ${CYAN}journalctl -u wg-quick@$WG_INTERFACE -f${NC}"
     echo -e "  Show FORWARD chain:          ${CYAN}iptables -L FORWARD -v -n${NC}"
     echo -e "  Show NAT rules:              ${CYAN}iptables -t nat -L -v -n${NC}"
     echo -e "  Show firewall rules:         ${CYAN}ufw status verbose${NC}"
@@ -1153,7 +1308,16 @@ show_summary() {
 # MAIN EXECUTION
 # =============================================================================
 main() {
+    # Parse command-line arguments first
+    parse_arguments "$@"
+
+    # Must be root
     check_root
+
+    # Detect and select WireGuard interface
+    select_wireguard_interface
+
+    # Show header
     header
 
     # Run all diagnostic checks
