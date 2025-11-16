@@ -1165,10 +1165,16 @@ install_wireguard() {
 Address = ${WG_SERVER_IP}
 ListenPort = ${WG_PORT}
 PrivateKey = ${server_private_key}
-SaveConfig = true
 
-# Note: NAT is handled automatically by wg-quick when net.ipv4.ip_forward=1
-# No need for manual iptables rules on modern Debian systems with nftables
+# NAT and forwarding rules for VPN traffic routing
+# These are REQUIRED - wg-quick does NOT configure NAT automatically
+# Using -I (insert) to place rules before UFW's DROP policy
+PostUp = iptables -I FORWARD 1 -i wg0 -j ACCEPT
+PostUp = iptables -I FORWARD 1 -o wg0 -j ACCEPT
+PostUp = iptables -t nat -A POSTROUTING -o ${default_interface} -j MASQUERADE
+PostDown = iptables -D FORWARD -i wg0 -j ACCEPT
+PostDown = iptables -D FORWARD -o wg0 -j ACCEPT
+PostDown = iptables -t nat -D POSTROUTING -o ${default_interface} -j MASQUERADE
 EOF
     fi
 
