@@ -112,7 +112,7 @@ init_log() {
         (umask 027 && touch "$LOG_FILE")
         chmod 640 "$LOG_FILE" 2>/dev/null || true
     fi
-    log "Starting VPS hardening and WireGuard setup (v2.0)"
+    log "Starting VPS hardening and WireGuard setup (v3.0)"
     log "Logging to $LOG_FILE"
     if [[ "$DRY_RUN" == "true" ]]; then
         warning "DRY RUN MODE - No changes will be made"
@@ -725,8 +725,7 @@ install_packages() {
         "software-properties-common" "lsb-release" "unattended-upgrades"
         "fail2ban" "git" "python3" "python3-pip" "python3-venv"
         "qrencode" "nginx" "certbot" "python3-certbot-nginx"
-        "zlib1g-dev" "uuid-dev" "libuv1-dev" "liblz4-dev" "libssl-dev"
-        "libmnl-dev" "rsyslog" "dnsutils"
+        "rsyslog" "dnsutils"
     )
 
     # Install critical packages first
@@ -1174,9 +1173,21 @@ configure_ufw_for_wireguard() {
         fi
 
         # Add NAT rules to UFW before.rules (insert before *filter table)
-        if ! grep -q "WIREGUARD NAT RULES" /etc/ufw/before.rules 2>/dev/null; then
-            # Backup original
-            cp /etc/ufw/before.rules /etc/ufw/before.rules.backup
+        # Check both for marker and actual NAT rule to ensure idempotency
+        if ! grep -q "START WIREGUARD NAT RULES" /etc/ufw/before.rules 2>/dev/null || \
+           ! grep -q "POSTROUTING -s ${wg_network} -o ${default_interface} -j MASQUERADE" /etc/ufw/before.rules 2>/dev/null; then
+
+            # Only backup if not already backed up
+            if [[ ! -f /etc/ufw/before.rules.backup-wireguard ]]; then
+                cp /etc/ufw/before.rules /etc/ufw/before.rules.backup-wireguard
+                log "Created backup of UFW rules at /etc/ufw/before.rules.backup-wireguard"
+            fi
+
+            # Remove any existing incomplete WireGuard NAT rules first
+            if grep -q "START WIREGUARD NAT RULES" /etc/ufw/before.rules 2>/dev/null; then
+                log "Removing existing incomplete WireGuard NAT rules..."
+                sed -i '/# START WIREGUARD NAT RULES/,/# END WIREGUARD NAT RULES/d' /etc/ufw/before.rules
+            fi
 
             # Create temporary file with NAT rules
             cat > /tmp/ufw_wg_rules << UEOF
@@ -1194,9 +1205,9 @@ UEOF
             mv /tmp/before.rules.new /etc/ufw/before.rules
             rm /tmp/ufw_wg_rules
 
-            log "UFW NAT rules added for WireGuard"
+            log "UFW NAT rules added for WireGuard (network: ${wg_network}, interface: ${default_interface})"
         else
-            log "UFW NAT rules already configured"
+            log "UFW NAT rules already properly configured for WireGuard"
         fi
 
         # Reload UFW to apply changes
@@ -1784,7 +1795,7 @@ create_credentials() {
 VPS SECURITY & WIREGUARD SETUP INFORMATION
 ========================================================
 Setup Date: $(date)
-Script Version: 2.0
+Script Version: 3.0
 Host FQDN: ${HOST_FQDN}
 Public IP: ${PUBLIC_IP}
 
