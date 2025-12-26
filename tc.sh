@@ -1592,6 +1592,28 @@ EOF
 configure_nginx() {
     section "Configuring Nginx Reverse Proxy"
 
+    # Fix nginx.conf to uncomment server_names_hash_bucket_size
+    log "Configuring nginx main settings..."
+    if [[ "$DRY_RUN" == "false" ]]; then
+        # Backup original nginx.conf if not already backed up
+        if [[ ! -f /etc/nginx/nginx.conf.backup-orig ]]; then
+            cp /etc/nginx/nginx.conf /etc/nginx/nginx.conf.backup-orig
+            log "Created backup of nginx.conf"
+        fi
+
+        # Uncomment server_names_hash_bucket_size if it's commented
+        if grep -q "^[[:space:]]*#[[:space:]]*server_names_hash_bucket_size" /etc/nginx/nginx.conf; then
+            sed -i 's/^[[:space:]]*#[[:space:]]*server_names_hash_bucket_size/    server_names_hash_bucket_size/' /etc/nginx/nginx.conf
+            log "Uncommented server_names_hash_bucket_size in nginx.conf"
+        elif ! grep -q "server_names_hash_bucket_size" /etc/nginx/nginx.conf; then
+            # If the line doesn't exist at all, add it to the http block
+            sed -i '/^http[[:space:]]*{/a \    server_names_hash_bucket_size 64;' /etc/nginx/nginx.conf
+            log "Added server_names_hash_bucket_size to nginx.conf"
+        else
+            log "server_names_hash_bucket_size already configured"
+        fi
+    fi
+
     # Only set up Netdata authentication if Netdata is being installed
     if [[ "$INSTALL_NETDATA" == "true" ]]; then
         log "Setting up Netdata authentication..."
