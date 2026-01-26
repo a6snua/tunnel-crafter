@@ -24,6 +24,7 @@ readonly WG_PORT=51820
 readonly WG_SERVER_IP="10.10.10.1/24"
 readonly SSH_PORT=22
 readonly PING_TEST_IP="4.2.2.1"
+WG_DNS="${WG_DNS:-1.1.1.1, 9.9.9.9}"
 
 # Feature Flags
 INSTALL_NETDATA="${INSTALL_NETDATA:-true}"
@@ -37,7 +38,7 @@ readonly DNS_TIMEOUT=5
 readonly PING_TIMEOUT=5
 
 # File Paths
-readonly CONFIG_FILE="vpn_setup.conf"
+CONFIG_FILE="${CONFIG_FILE:-vpn_setup.conf}"
 readonly LOG_FILE="/var/log/secure_vpn_setup.log"
 
 # Runtime Variables (do not modify)
@@ -177,7 +178,23 @@ cleanup() {
     local exit_code=$?
     if [[ $exit_code -ne 0 ]]; then
         warning "Script failed with exit code $exit_code"
-        # Add cleanup logic here if needed
+
+        # Remove temp files that may have been left behind
+        rm -f /tmp/ufw_wg_rules /tmp/before.rules.new 2>/dev/null
+
+        # Log diagnostic state if log file is writable
+        if [[ -w "$LOG_FILE" ]] 2>/dev/null; then
+            echo "$(date '+%Y-%m-%d %H:%M:%S') - FAILURE: Script exited with code $exit_code" >> "$LOG_FILE"
+            echo "$(date '+%Y-%m-%d %H:%M:%S') - FAILURE: Last working directory: $(pwd)" >> "$LOG_FILE"
+        fi
+
+        echo ""
+        echo -e "${RED}========================================${NC}"
+        echo -e "${RED}  SETUP FAILED${NC}"
+        echo -e "${RED}========================================${NC}"
+        echo -e "Check the log file for details: ${LOG_FILE}"
+        echo -e "You may need to review partially applied changes."
+        echo -e "${RED}========================================${NC}"
     fi
 }
 
@@ -286,7 +303,13 @@ check_os() {
 load_config() {
     if [[ -f "$CONFIG_FILE" ]]; then
         log "Loading configuration from $CONFIG_FILE"
-        # Safely source the config file
+
+        # Validate config file contains only variable assignments (VAR=value)
+        # Reject files with shell commands, pipes, subshells, or semicolons
+        if grep -qvE '^\s*$|^\s*#|^[A-Za-z_][A-Za-z0-9_]*=' "$CONFIG_FILE"; then
+            error "Config file '$CONFIG_FILE' contains invalid lines. Only VAR=value assignments and comments are allowed."
+        fi
+
         # shellcheck source=/dev/null
         source "$CONFIG_FILE"
     fi
@@ -445,13 +468,20 @@ test_network() {
     log "Testing connectivity to $PING_TEST_IP..."
 
     if ping -c3 -W"$PING_TIMEOUT" "$PING_TEST_IP" >/dev/null 2>&1; then
-        log "Network connectivity: OK"
+        log "Network connectivity (ICMP): OK"
         return 0
-    else
-        warning "Ping test failed. Showing detailed output:"
-        ping -c3 -W"$PING_TIMEOUT" "$PING_TEST_IP" || true
-        error "Network connectivity test failed. Please check your network configuration."
     fi
+
+    warning "ICMP ping failed, trying HTTP fallback..."
+
+    if curl -s --max-time "$CURL_TIMEOUT" -o /dev/null -w '%{http_code}' https://api.ipify.org 2>/dev/null | grep -q '^[23]'; then
+        log "Network connectivity (HTTP): OK"
+        warning "ICMP is blocked on this network but HTTP works. Continuing."
+        return 0
+    fi
+
+    warning "Both ICMP and HTTP connectivity tests failed."
+    error "Network connectivity test failed. Please check your network configuration."
 }
 
 # =============================================================================
@@ -461,6 +491,17 @@ test_network() {
 # Get and validate username
 select_user_name() {
     section "Configuring User Account"
+
+    # If username was set via -u flag, validate and use it
+    if [[ -n "$USER_ACCOUNT_NAME" ]]; then
+        if validate_username "$USER_ACCOUNT_NAME"; then
+            log "Using username from command line: $USER_ACCOUNT_NAME"
+            return 0
+        else
+            warning "Invalid username from -u flag: $USER_ACCOUNT_NAME"
+            USER_ACCOUNT_NAME=""
+        fi
+    fi
 
     # Use default username
     local default_user="$DEFAULT_USERNAME"
@@ -822,6 +863,11 @@ net.ipv4.conf.default.accept_redirects = 0
 net.ipv6.conf.all.accept_redirects = 0
 net.ipv6.conf.default.accept_redirects = 0
 
+# Disable IPv6 completely
+net.ipv6.conf.all.disable_ipv6 = 1
+net.ipv6.conf.default.disable_ipv6 = 1
+net.ipv6.conf.lo.disable_ipv6 = 1
+
 # Enable IP forwarding (required for WireGuard)
 net.ipv4.ip_forward = 1
 net.ipv4.conf.all.send_redirects = 0
@@ -888,7 +934,7 @@ secure_ssh() {
         if [[ "$DRY_RUN" == "false" ]]; then
             # Generate strong random password
             local user_password
-            user_password=$(head -c 32 /dev/urandom | tr -dc 'A-Za-z0-9!@#%^&*()_+-=' | head -c 20)
+            user_password=$(head -c 32 /dev/urandom | tr -dc 'A-Za-z0-9!@#%^&*()_+=-' | head -c 20)
             echo "$USER_ACCOUNT_NAME:$user_password" | chpasswd
 
             # Display password securely (not logged to file)
@@ -1001,14 +1047,33 @@ KexAlgorithms curve25519-sha256@libssh.org,diffie-hellman-group-exchange-sha256
 Ciphers chacha20-poly1305@openssh.com,aes256-gcm@openssh.com,aes128-gcm@openssh.com,aes256-ctr,aes192-ctr,aes128-ctr
 MACs hmac-sha2-512-etm@openssh.com,hmac-sha2-256-etm@openssh.com,umac-128-etm@openssh.com
 
-# Allow specific user
-AllowUsers ${USER_ACCOUNT_NAME}
+# Allow specific users (root restricted to key-only via PermitRootLogin)
+AllowUsers ${USER_ACCOUNT_NAME} root
 EOF
     fi
 
     # Test SSH configuration before restarting
     if [[ "$DRY_RUN" == "false" ]]; then
         sshd -t || error "SSH configuration test failed"
+
+        # Verify the allowed user account exists and has a valid shell before restarting
+        if ! id "$USER_ACCOUNT_NAME" &>/dev/null; then
+            error "SSH restart aborted: user '$USER_ACCOUNT_NAME' does not exist. Restarting would lock out all SSH access."
+        fi
+
+        local user_shell
+        user_shell=$(getent passwd "$USER_ACCOUNT_NAME" | cut -d: -f7)
+        if [[ "$user_shell" == */nologin || "$user_shell" == */false ]]; then
+            error "SSH restart aborted: user '$USER_ACCOUNT_NAME' has a non-login shell ($user_shell). Restarting would lock out all SSH access."
+        fi
+
+        # Verify SSH key is actually readable if password auth is disabled
+        if [[ "$password_auth" == "no" ]]; then
+            local auth_keys="/home/${USER_ACCOUNT_NAME}/.ssh/authorized_keys"
+            if [[ ! -s "$auth_keys" ]]; then
+                error "SSH restart aborted: password auth is disabled but $auth_keys is missing or empty. Restarting would lock out all SSH access."
+            fi
+        fi
     fi
 
     # Restart SSH service
@@ -1138,13 +1203,18 @@ check_wireguard_support() {
 
     log "Checking WireGuard kernel support..."
 
-    if modprobe wireguard 2>/dev/null; then
-        log "WireGuard kernel module: AVAILABLE"
+    if [[ -f /sys/module/wireguard/version ]]; then
+        log "WireGuard kernel module: BUILT-IN"
         return 0
     fi
 
-    if [[ -f /sys/module/wireguard/version ]]; then
-        log "WireGuard kernel module: BUILT-IN"
+    if [[ "$DRY_RUN" == "true" ]]; then
+        log "[DRY-RUN] Would attempt to load WireGuard kernel module"
+        return 0
+    fi
+
+    if modprobe wireguard 2>/dev/null; then
+        log "WireGuard kernel module: AVAILABLE"
         return 0
     fi
 
@@ -1189,8 +1259,12 @@ configure_ufw_for_wireguard() {
                 sed -i '/# START WIREGUARD NAT RULES/,/# END WIREGUARD NAT RULES/d' /etc/ufw/before.rules
             fi
 
-            # Create temporary file with NAT rules
-            cat > /tmp/ufw_wg_rules << UEOF
+            # Create temporary files securely
+            local tmp_wg_rules tmp_before_new
+            tmp_wg_rules=$(mktemp) || error "Failed to create temp file"
+            tmp_before_new=$(mktemp) || { rm -f "$tmp_wg_rules"; error "Failed to create temp file"; }
+
+            cat > "$tmp_wg_rules" << UEOF
 # START WIREGUARD NAT RULES
 *nat
 :POSTROUTING ACCEPT [0:0]
@@ -1201,9 +1275,9 @@ COMMIT
 UEOF
 
             # Prepend to before.rules
-            cat /tmp/ufw_wg_rules /etc/ufw/before.rules > /tmp/before.rules.new
-            mv /tmp/before.rules.new /etc/ufw/before.rules
-            rm /tmp/ufw_wg_rules
+            cat "$tmp_wg_rules" /etc/ufw/before.rules > "$tmp_before_new"
+            mv "$tmp_before_new" /etc/ufw/before.rules
+            rm -f "$tmp_wg_rules" "$tmp_before_new"
 
             log "UFW NAT rules added for WireGuard (network: ${wg_network}, interface: ${default_interface})"
         else
@@ -1225,32 +1299,6 @@ install_wireguard() {
     exec_cmd mkdir -p /etc/wireguard/clients
     exec_cmd chmod 700 /etc/wireguard
 
-    # Check if already configured
-    if [[ -f /etc/wireguard/server.key ]] && [[ -f /etc/wireguard/wg0.conf ]]; then
-        log "WireGuard already configured, skipping key generation"
-        return 0
-    fi
-
-    # Generate server keys
-    log "Generating WireGuard server keys..."
-    if [[ "$DRY_RUN" == "false" ]]; then
-        wg genkey | tee /etc/wireguard/server.key | wg pubkey > /etc/wireguard/server.pub
-        chmod 600 /etc/wireguard/server.key
-    fi
-
-    local server_private_key=""
-    local server_public_key=""
-
-    if [[ "$DRY_RUN" == "false" ]]; then
-        server_private_key=$(cat /etc/wireguard/server.key)
-        server_public_key=$(cat /etc/wireguard/server.pub)
-
-        # Validate keys
-        if [[ -z "$server_private_key" ]] || [[ -z "$server_public_key" ]]; then
-            error "Failed to generate WireGuard keys"
-        fi
-    fi
-
     # Determine default network interface with validation
     local default_interface
     default_interface=$(ip -o -4 route show to default 2>/dev/null | awk '{print $5; exit}')
@@ -1258,6 +1306,14 @@ install_wireguard() {
     if [[ -z "$default_interface" ]]; then
         # Fallback: try to detect interface with public IP
         default_interface=$(ip -o -4 addr show | grep "$PUBLIC_IP" | awk '{print $2; exit}')
+    fi
+
+    # Fallback: read from saved config if available
+    if [[ -z "$default_interface" ]] && [[ -f /root/vpn_credentials/vpn_config.env ]]; then
+        default_interface=$(grep '^DEFAULT_INTERFACE=' /root/vpn_credentials/vpn_config.env 2>/dev/null | cut -d= -f2)
+        if [[ -n "$default_interface" ]]; then
+            log "Using saved network interface: $default_interface"
+        fi
     fi
 
     if [[ -z "$default_interface" ]]; then
@@ -1286,11 +1342,35 @@ install_wireguard() {
         echo "DEFAULT_INTERFACE=$default_interface" > /root/vpn_credentials/vpn_config.env
     fi
 
-    # Create WireGuard server configuration
-    log "Creating WireGuard server configuration..."
+    # Check if keys and config already exist — skip generation if so
+    if [[ -f /etc/wireguard/server.key ]] && [[ -f /etc/wireguard/wg0.conf ]]; then
+        log "WireGuard already configured, skipping key generation and config creation"
+    else
+        # Generate server keys
+        log "Generating WireGuard server keys..."
+        if [[ "$DRY_RUN" == "false" ]]; then
+            wg genkey | tee /etc/wireguard/server.key | wg pubkey > /etc/wireguard/server.pub
+            chmod 600 /etc/wireguard/server.key
+        fi
 
-    if [[ "$DRY_RUN" == "false" ]]; then
-        cat > /etc/wireguard/wg0.conf << EOF
+        local server_private_key=""
+        local server_public_key=""
+
+        if [[ "$DRY_RUN" == "false" ]]; then
+            server_private_key=$(cat /etc/wireguard/server.key)
+            server_public_key=$(cat /etc/wireguard/server.pub)
+
+            # Validate keys
+            if [[ -z "$server_private_key" ]] || [[ -z "$server_public_key" ]]; then
+                error "Failed to generate WireGuard keys"
+            fi
+        fi
+
+        # Create WireGuard server configuration
+        log "Creating WireGuard server configuration..."
+
+        if [[ "$DRY_RUN" == "false" ]]; then
+            cat > /etc/wireguard/wg0.conf << EOF
 [Interface]
 Address = ${WG_SERVER_IP}
 ListenPort = ${WG_PORT}
@@ -1298,49 +1378,45 @@ PrivateKey = ${server_private_key}
 
 # Enable NAT/Masquerading for WireGuard clients
 PostUp = iptables -A FORWARD -i %i -j ACCEPT; iptables -A FORWARD -o %i -j ACCEPT; iptables -t nat -A POSTROUTING -o ${default_interface} -j MASQUERADE
-PostDown = iptables -D FORWARD -i %i -j ACCEPT; iptables -D FORWARD -o %i -j ACCEPT; iptables -D nat POSTROUTING -o ${default_interface} -j MASQUERADE
-
-# IPv6 support (optional, if IPv6 is enabled)
-PostUp = ip6tables -A FORWARD -i %i -j ACCEPT; ip6tables -A FORWARD -o %i -j ACCEPT; ip6tables -t nat -A POSTROUTING -o ${default_interface} -j MASQUERADE
-PostDown = ip6tables -D FORWARD -i %i -j ACCEPT; ip6tables -D FORWARD -o %i -j ACCEPT; ip6tables -D nat POSTROUTING -o ${default_interface} -j MASQUERADE
+PostDown = iptables -D FORWARD -i %i -j ACCEPT; iptables -D FORWARD -o %i -j ACCEPT; iptables -t nat -D POSTROUTING -o ${default_interface} -j MASQUERADE
 EOF
-    fi
-
-    # Generate first client configuration
-    log "Creating first client configuration..."
-
-    if [[ "$DRY_RUN" == "false" ]]; then
-        wg genkey | tee /etc/wireguard/clients/client1.key | wg pubkey > /etc/wireguard/clients/client1.pub
-        chmod 600 /etc/wireguard/clients/client1.key
-
-        local client1_private_key
-        local client1_public_key
-        client1_private_key=$(cat /etc/wireguard/clients/client1.key)
-        client1_public_key=$(cat /etc/wireguard/clients/client1.pub)
-
-        # Validate client keys
-        if [[ -z "$client1_private_key" ]] || [[ -z "$client1_public_key" ]]; then
-            error "Failed to generate client keys"
         fi
 
-        local client1_ip="10.10.10.2/32"
+        # Generate first client configuration
+        log "Creating first client configuration..."
 
-        # Create client configuration file
-        cat > /etc/wireguard/clients/client1.conf << EOF
+        if [[ "$DRY_RUN" == "false" ]]; then
+            wg genkey | tee /etc/wireguard/clients/client1.key | wg pubkey > /etc/wireguard/clients/client1.pub
+            chmod 600 /etc/wireguard/clients/client1.key
+
+            local client1_private_key
+            local client1_public_key
+            client1_private_key=$(cat /etc/wireguard/clients/client1.key)
+            client1_public_key=$(cat /etc/wireguard/clients/client1.pub)
+
+            # Validate client keys
+            if [[ -z "$client1_private_key" ]] || [[ -z "$client1_public_key" ]]; then
+                error "Failed to generate client keys"
+            fi
+
+            local client1_ip="10.10.10.2/32"
+
+            # Create client configuration file
+            cat > /etc/wireguard/clients/client1.conf << EOF
 [Interface]
 PrivateKey = ${client1_private_key}
 Address = ${client1_ip%/*}/24
-DNS = 1.1.1.1, 9.9.9.9
+DNS = ${WG_DNS}
 
 [Peer]
 PublicKey = ${server_public_key}
 Endpoint = ${PUBLIC_IP}:${WG_PORT}
-AllowedIPs = 0.0.0.0/0, ::/0
+AllowedIPs = 0.0.0.0/0
 PersistentKeepalive = 25
 EOF
 
-        # Add client peer to server configuration
-        cat >> /etc/wireguard/wg0.conf << EOF
+            # Add client peer to server configuration
+            cat >> /etc/wireguard/wg0.conf << EOF
 
 # Client 1
 [Peer]
@@ -1348,28 +1424,36 @@ PublicKey = ${client1_public_key}
 AllowedIPs = ${client1_ip}
 EOF
 
-        # Generate QR code for easy mobile setup
-        if command -v qrencode &>/dev/null; then
-            qrencode -t ansiutf8 < /etc/wireguard/clients/client1.conf > /etc/wireguard/clients/client1_qr.txt 2>/dev/null || true
+            # Generate QR code for easy mobile setup
+            if command -v qrencode &>/dev/null; then
+                qrencode -t ansiutf8 < /etc/wireguard/clients/client1.conf > /etc/wireguard/clients/client1_qr.txt 2>/dev/null || true
+            fi
         fi
     fi
 
-    # Configure UFW for WireGuard forwarding
-    configure_ufw_for_wireguard "$default_interface" "${WG_SERVER_IP%/*}/24"
+    # Configure UFW for WireGuard forwarding (always runs for idempotency)
+    # Derive network address (10.10.10.1/24 -> 10.10.10.0/24)
+    local wg_host_ip="${WG_SERVER_IP%/*}"
+    local wg_network="${wg_host_ip%.*}.0/24"
+    configure_ufw_for_wireguard "$default_interface" "$wg_network"
 
-    # Enable and start WireGuard service
+    # Enable and start WireGuard service (always runs for idempotency)
     log "Enabling WireGuard service..."
     exec_cmd systemctl enable wg-quick@wg0
-    exec_cmd systemctl start wg-quick@wg0
-
-    # Wait a moment and verify it's running
     if [[ "$DRY_RUN" == "false" ]]; then
-        sleep 2
         if systemctl is-active --quiet wg-quick@wg0; then
-            log "WireGuard VPN is running"
+            log "WireGuard service already running"
         else
-            error "WireGuard service failed to start"
+            exec_cmd systemctl start wg-quick@wg0
+            sleep 2
+            if systemctl is-active --quiet wg-quick@wg0; then
+                log "WireGuard VPN is running"
+            else
+                error "WireGuard service failed to start"
+            fi
         fi
+    else
+        exec_cmd systemctl start wg-quick@wg0
     fi
 
     log "WireGuard VPN installation completed"
@@ -1442,9 +1526,7 @@ install_wgdashboard() {
     # Clone repository
     log "Downloading WGDashboard..."
     if [[ "$DRY_RUN" == "false" ]]; then
-        cd /opt || error "Failed to change to /opt directory"
-        git clone --depth 1 https://github.com/donaldzou/WGDashboard.git || error "Failed to clone WGDashboard repository"
-        cd WGDashboard/src || error "Failed to change to WGDashboard/src directory"
+        git clone --depth 1 https://github.com/donaldzou/WGDashboard.git /opt/WGDashboard || error "Failed to clone WGDashboard repository"
     fi
 
     # Create required directories
@@ -1456,8 +1538,7 @@ install_wgdashboard() {
         chmod +x "$wg_dash_dir/src/wgd.sh"
 
         log "Installing WGDashboard dependencies (this may take a few minutes)..."
-        cd "$wg_dash_dir/src" || error "Failed to change directory"
-        ./wgd.sh install || error "WGDashboard installation failed"
+        (cd "$wg_dash_dir/src" && ./wgd.sh install) || error "WGDashboard installation failed"
     fi
 
     # Create systemd service
@@ -1471,12 +1552,13 @@ After=network.target
 Wants=wg-quick@wg0.service
 
 [Service]
-Type=simple
+Type=forking
 WorkingDirectory=/opt/WGDashboard/src
-ExecStart=/bin/bash -c '/opt/WGDashboard/src/wgd.sh start && while true; do sleep 3600; done'
+ExecStart=/opt/WGDashboard/src/wgd.sh start
+ExecStop=/opt/WGDashboard/src/wgd.sh stop
 Restart=on-failure
 RestartSec=10
-KillMode=process
+KillMode=control-group
 
 [Install]
 WantedBy=multi-user.target
@@ -1671,7 +1753,6 @@ upstream wgdashboard {
 
 server {
     listen 80 default_server;
-    listen [::]:80 default_server;
 
     server_name _;
 
@@ -1754,9 +1835,9 @@ EOF
             if certbot --nginx -d "$HOST_FQDN" --register-unsafely-without-email --non-interactive --agree-tos 2>&1; then
                 log "SSL certificate obtained successfully"
 
-                # Add additional SSL hardening
+                # Add additional SSL hardening (only to the SSL server block, identified by listen 443)
                 if ! grep -q "ssl_stapling" /etc/nginx/sites-available/default; then
-                    sed -i '/server_name/a \    # SSL hardening\n    ssl_stapling on;\n    ssl_stapling_verify on;\n    resolver 1.1.1.1 8.8.8.8 valid=300s;\n    resolver_timeout 5s;\n    add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;' /etc/nginx/sites-available/default
+                    sed -i '/listen.*443.*ssl/a \    # SSL hardening\n    ssl_stapling on;\n    ssl_stapling_verify on;\n    resolver 1.1.1.1 8.8.8.8 valid=300s;\n    resolver_timeout 5s;\n    add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;' /etc/nginx/sites-available/default
 
                     # Test and restart again
                     nginx -t || error "Nginx SSL configuration test failed"
@@ -1766,7 +1847,7 @@ EOF
                 log "SSL/TLS configuration completed"
             else
                 warning "Let's Encrypt certificate request failed"
-                warning "This usually means DNS is not properly configured for $HOST_FQDN"
+                warning "Common causes: DNS not configured for $HOST_FQDN, or port 80 is not reachable from the internet (blocked by upstream firewall/provider)"
 
                 read -rp "Continue without SSL/TLS? Enter 'INSECURE' to proceed: " no_tls_response
                 if [[ "$no_tls_response" != "INSECURE" ]]; then
@@ -1965,6 +2046,10 @@ parse_arguments() {
                 usage
                 ;;
             -c|--config)
+                if [[ $# -lt 2 ]] || [[ "$2" == -* ]]; then
+                    echo "Error: -c/--config requires a filename argument" >&2
+                    exit 1
+                fi
                 CONFIG_FILE="$2"
                 shift 2
                 ;;
@@ -1987,6 +2072,10 @@ parse_arguments() {
                 shift
                 ;;
             -u|--username)
+                if [[ $# -lt 2 ]] || [[ "$2" == -* ]]; then
+                    echo "Error: -u/--username requires a username argument" >&2
+                    exit 1
+                fi
                 USER_ACCOUNT_NAME="$2"
                 shift 2
                 ;;
