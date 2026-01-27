@@ -863,34 +863,47 @@ harden_sysctl() {
 
     if [[ "$DRY_RUN" == "false" ]]; then
         cat > /etc/sysctl.d/99-security.conf << 'EOF'
-# IP Spoofing protection
+# IP Spoofing protection (reverse path filtering)
 # Note: rp_filter=1 (strict) works for simple single-interface WireGuard setups.
 # For multi-homed servers or asymmetric routing, change to rp_filter=2 (loose).
 # The effective value per-interface is max(conf.all, conf.INTERFACE).
 net.ipv4.conf.all.rp_filter = 1
 net.ipv4.conf.default.rp_filter = 1
 
-# Block SYN attacks
+# SYN flood protection
 net.ipv4.tcp_syncookies = 1
 net.ipv4.tcp_max_syn_backlog = 2048
 net.ipv4.tcp_synack_retries = 2
 net.ipv4.tcp_syn_retries = 5
 
-# Disable IP source routing
+# Disable IP source routing (block source-routed packets that could bypass firewalls)
 net.ipv4.conf.all.accept_source_route = 0
 net.ipv4.conf.default.accept_source_route = 0
 
-# Ignore ICMP broadcasts
+# ICMP hardening
 net.ipv4.icmp_echo_ignore_broadcasts = 1
+net.ipv4.icmp_ignore_bogus_error_responses = 1
 
-# Disable ICMP redirects
+# Disable ICMP redirects (prevent MITM via fake redirects / route hijacking)
 net.ipv4.conf.all.accept_redirects = 0
 net.ipv4.conf.default.accept_redirects = 0
+net.ipv4.conf.all.secure_redirects = 0
+net.ipv4.conf.default.secure_redirects = 0
+
+# Log martian packets (spoofed/impossible source addresses)
+net.ipv4.conf.all.log_martians = 1
+net.ipv4.conf.default.log_martians = 1
 
 # Disable IPv6 completely
 net.ipv6.conf.all.disable_ipv6 = 1
 net.ipv6.conf.default.disable_ipv6 = 1
 net.ipv6.conf.lo.disable_ipv6 = 1
+
+# IPv6 hardening (defense-in-depth if IPv6 is re-enabled later)
+net.ipv6.conf.all.accept_source_route = 0
+net.ipv6.conf.default.accept_source_route = 0
+net.ipv6.conf.all.accept_redirects = 0
+net.ipv6.conf.default.accept_redirects = 0
 
 # Enable IP forwarding (required for WireGuard)
 net.ipv4.ip_forward = 1
@@ -900,14 +913,20 @@ net.ipv4.conf.default.send_redirects = 0
 # Increase system file descriptor limit
 fs.file-max = 65535
 
-# Protect Against TCP Time-Wait
+# Protect against TCP Time-Wait assassination
 net.ipv4.tcp_rfc1337 = 1
 
-# Decrease the time default value for connections
+# TCP connection tuning
 net.ipv4.tcp_fin_timeout = 15
 net.ipv4.tcp_keepalive_time = 300
 net.ipv4.tcp_keepalive_probes = 5
 net.ipv4.tcp_keepalive_intvl = 15
+
+# Kernel hardening
+kernel.dmesg_restrict = 1
+kernel.kptr_restrict = 1
+kernel.unprivileged_bpf_disabled = 1
+net.core.bpf_jit_harden = 2
 EOF
 
         # Apply sysctl settings
@@ -1190,8 +1209,15 @@ setup_firewall() {
     fi
 
     if [[ "$DRY_RUN" == "false" ]]; then
+        # Derive WireGuard subnet for IP whitelist
+        local wg_host_ip="${WG_SERVER_IP%/*}"
+        local wg_network="${wg_host_ip%.*}.0/24"
+
         cat > /etc/fail2ban/jail.d/custom.conf << EOF
 [DEFAULT]
+# Whitelist: loopback + server public IP + WireGuard subnet (prevents self-lockout)
+ignoreip = 127.0.0.1/8 ::1 ${PUBLIC_IP} ${wg_network}
+
 # Progressive banning: starts at 12 hours, doubles each time, max 48 hours
 bantime = 43200
 bantime.increment = true
@@ -1199,14 +1225,48 @@ bantime.factor = 2
 bantime.maxtime = 172800
 findtime = 600
 maxretry = 3
-banaction = iptables-multiport
 
+# Use UFW as the ban action (keeps bans visible in ufw status, no orphan iptables rules)
+banaction = ufw
+banaction_allports = ufw
+
+# --- SSH ---
 [sshd]
 enabled = true
 port = ${SSH_PORT}
-filter = sshd
-logpath = /var/log/auth.log
+mode = aggressive
 maxretry = 3
+
+# --- Nginx ---
+[nginx-http-auth]
+enabled = true
+port = http,https
+maxretry = 3
+findtime = 600
+
+[nginx-botsearch]
+enabled = true
+port = http,https
+maxretry = 5
+findtime = 600
+
+[nginx-bad-request]
+enabled = true
+port = http,https
+filter = nginx-4xx
+maxretry = 10
+findtime = 600
+logpath = /var/log/nginx/*.access.log
+EOF
+
+        # Create custom nginx-4xx filter for catching scanners and brute-force
+        cat > /etc/fail2ban/filter.d/nginx-4xx.conf << 'EOF'
+# Fail2Ban filter for nginx 4xx status codes
+# Catches scanners, brute-force attempts, and path enumeration
+
+[Definition]
+failregex = ^<HOST> -.*"(GET|POST|HEAD|PUT|DELETE|PATCH|OPTIONS)\s+\S+\s+HTTP/\S+" (400|401|403|404|444)
+ignoreregex =
 EOF
     fi
 
@@ -1793,12 +1853,14 @@ server {
     listen 80 default_server;
 
     server_name _;
+    server_tokens off;
 
     # Security headers
     add_header X-Content-Type-Options nosniff;
     add_header X-XSS-Protection "1; mode=block";
     add_header X-Frame-Options SAMEORIGIN;
     add_header Referrer-Policy strict-origin-when-cross-origin;
+    add_header Permissions-Policy "camera=(), microphone=(), geolocation=(), payment=()";
 
 EOF
 
