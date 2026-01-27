@@ -910,6 +910,9 @@ net.ipv4.ip_forward = 1
 net.ipv4.conf.all.send_redirects = 0
 net.ipv4.conf.default.send_redirects = 0
 
+# Allow reverse-path filtering to honor fwmarks (required by wg-quick when rp_filter=1)
+net.ipv4.conf.all.src_valid_mark = 1
+
 # Increase system file descriptor limit
 fs.file-max = 65535
 
@@ -990,7 +993,7 @@ secure_ssh() {
             echo -e "${YELLOW}Change this password after first login!${NC}"
             echo -e "${YELLOW}========================================${NC}"
             echo ""
-            sleep 5
+            read -rp "Press ENTER after saving the password above..."
         fi
 
         # Add user to sudo group
@@ -1156,7 +1159,7 @@ add_ufw_rule() {
         return 0
     fi
 
-    if ! ufw status verbose | grep -q "^${port}/${proto}.*ALLOW.*${comment:-.}" ; then
+    if ! ufw status verbose | grep -q "${port}/${proto}.*ALLOW" ; then
         log "Adding UFW rule: ${port}/${proto} (${comment})"
         ufw allow "${port}/${proto}" comment "$comment"
     else
@@ -1236,38 +1239,9 @@ enabled = true
 port = ${SSH_PORT}
 mode = aggressive
 maxretry = 3
-
-# --- Nginx ---
-[nginx-http-auth]
-enabled = true
-port = http,https
-maxretry = 3
-findtime = 600
-
-[nginx-botsearch]
-enabled = true
-port = http,https
-maxretry = 5
-findtime = 600
-
-[nginx-bad-request]
-enabled = true
-port = http,https
-filter = nginx-4xx
-maxretry = 10
-findtime = 600
-logpath = /var/log/nginx/*.access.log
 EOF
-
-        # Create custom nginx-4xx filter for catching scanners and brute-force
-        cat > /etc/fail2ban/filter.d/nginx-4xx.conf << 'EOF'
-# Fail2Ban filter for nginx 4xx status codes
-# Catches scanners, brute-force attempts, and path enumeration
-
-[Definition]
-failregex = ^<HOST> -.*"(GET|POST|HEAD|PUT|DELETE|PATCH|OPTIONS)\s+\S+\s+HTTP/\S+" (400|401|403|404|444)
-ignoreregex =
-EOF
+        # Nginx jails are added later by configure_nginx() after nginx is running,
+        # so fail2ban doesn't log errors about missing /var/log/nginx/*.log files
     fi
 
     exec_cmd systemctl enable fail2ban
@@ -1319,10 +1293,23 @@ configure_ufw_for_wireguard() {
     log "Configuring UFW for WireGuard traffic forwarding..."
 
     if [[ "$DRY_RUN" == "false" ]]; then
-        # Set default forward policy to ACCEPT
-        if grep -q 'DEFAULT_FORWARD_POLICY="DROP"' /etc/default/ufw 2>/dev/null; then
-            sed -i 's/DEFAULT_FORWARD_POLICY="DROP"/DEFAULT_FORWARD_POLICY="ACCEPT"/' /etc/default/ufw
-            log "UFW forward policy set to ACCEPT"
+        # Add explicit UFW route rules for WireGuard forwarding (keeps DEFAULT_FORWARD_POLICY="DROP")
+        # These allow traffic to/from wg0 without opening forwarding globally
+        local route_rules_needed=false
+        if ! ufw route status | grep -q "wg0.*${default_interface}.*ALLOW" 2>/dev/null; then
+            route_rules_needed=true
+        fi
+        if ! ufw route status | grep -q "${default_interface}.*wg0.*ALLOW" 2>/dev/null; then
+            route_rules_needed=true
+        fi
+
+        if [[ "$route_rules_needed" == "true" ]]; then
+            log "Adding UFW route rules for WireGuard forwarding..."
+            ufw route allow in on wg0 out on "$default_interface" 2>/dev/null || warning "Failed to add UFW route rule (wg0 → ${default_interface})"
+            ufw route allow in on "$default_interface" out on wg0 2>/dev/null || warning "Failed to add UFW route rule (${default_interface} → wg0)"
+            log "UFW route rules added for WireGuard forwarding"
+        else
+            log "UFW route rules for WireGuard already present"
         fi
 
         # Add NAT rules to UFW before.rules (insert before *filter table)
@@ -1342,8 +1329,12 @@ configure_ufw_for_wireguard() {
                     log "Removing existing WireGuard NAT rules..."
                     sed -i '/# START WIREGUARD NAT RULES/,/# END WIREGUARD NAT RULES/d' /etc/ufw/before.rules
                 else
-                    warning "Found START marker without END marker in before.rules — skipping removal to avoid data loss"
-                    warning "Manually inspect /etc/ufw/before.rules and restore from backup if needed"
+                    warning "Found START marker without END marker in before.rules — skipping NAT insertion to avoid duplicates"
+                    warning "Manually inspect /etc/ufw/before.rules and restore from /etc/ufw/before.rules.backup-wireguard"
+                    # Reload UFW with existing rules and return; do not prepend a second NAT block
+                    ufw reload >/dev/null 2>&1 || warning "Failed to reload UFW"
+                    log "UFW configured for WireGuard forwarding (NAT rules require manual repair)"
+                    return 0
                 fi
             fi
 
@@ -1365,7 +1356,8 @@ UEOF
             # Prepend to before.rules
             cat "$tmp_wg_rules" /etc/ufw/before.rules > "$tmp_before_new"
             mv "$tmp_before_new" /etc/ufw/before.rules
-            chmod 640 /etc/ufw/before.rules
+            chown root:root /etc/ufw/before.rules
+            chmod 644 /etc/ufw/before.rules
             rm -f "$tmp_wg_rules"
 
             log "UFW NAT rules added for WireGuard (network: ${wg_network}, interface: ${default_interface})"
@@ -1437,10 +1429,15 @@ install_wireguard() {
         fi
     fi
 
+    # Track whether config was just (re)generated so we know to restart the service
+    local config_regenerated=false
+
     # Check if keys and config already exist — skip generation if so
-    if [[ -f /etc/wireguard/server.key ]] && [[ -f /etc/wireguard/wg0.conf ]]; then
+    # Require server.key to be non-empty; an empty file indicates a prior failed generation
+    if [[ -s /etc/wireguard/server.key ]] && [[ -s /etc/wireguard/wg0.conf ]]; then
         log "WireGuard already configured, skipping key generation and config creation"
     else
+        config_regenerated=true
         # Generate server keys
         log "Generating WireGuard server keys..."
         if [[ "$DRY_RUN" == "false" ]]; then
@@ -1465,7 +1462,7 @@ install_wireguard() {
         log "Creating WireGuard server configuration..."
 
         if [[ "$DRY_RUN" == "false" ]]; then
-            # NAT and forwarding are handled by UFW (before.rules + DEFAULT_FORWARD_POLICY=ACCEPT)
+            # NAT and forwarding are handled by UFW (before.rules NAT + ufw route rules)
             # Do NOT add PostUp/PostDown iptables rules here — they would duplicate UFW's rules
             # and the PostUp MASQUERADE lacks a -s subnet restriction, masquerading all traffic
             cat > /etc/wireguard/wg0.conf << EOF
@@ -1473,6 +1470,7 @@ install_wireguard() {
 Address = ${WG_SERVER_IP}
 ListenPort = ${WG_PORT}
 PrivateKey = ${server_private_key}
+SaveConfig = false
 EOF
             chmod 600 /etc/wireguard/wg0.conf
         fi
@@ -1538,15 +1536,20 @@ EOF
     exec_cmd systemctl enable wg-quick@wg0
     if [[ "$DRY_RUN" == "false" ]]; then
         if systemctl is-active --quiet wg-quick@wg0; then
-            log "WireGuard service already running"
+            if [[ "$config_regenerated" == "true" ]]; then
+                log "WireGuard running but config was regenerated — restarting..."
+                exec_cmd systemctl restart wg-quick@wg0
+            else
+                log "WireGuard service already running"
+            fi
         else
             exec_cmd systemctl start wg-quick@wg0
-            sleep 2
-            if systemctl is-active --quiet wg-quick@wg0; then
-                log "WireGuard VPN is running"
-            else
-                error "WireGuard service failed to start"
-            fi
+        fi
+        sleep 2
+        if systemctl is-active --quiet wg-quick@wg0; then
+            log "WireGuard VPN is running"
+        else
+            error "WireGuard service failed to start"
         fi
     else
         exec_cmd systemctl start wg-quick@wg0
@@ -1927,6 +1930,47 @@ EOF
     # Restart Nginx
     exec_cmd systemctl restart nginx
 
+    # Now that nginx is running and log files exist, add fail2ban nginx jails
+    if [[ "$DRY_RUN" == "false" ]]; then
+        log "Adding fail2ban nginx jails..."
+
+        cat > /etc/fail2ban/jail.d/nginx.conf << 'EOF'
+# --- Nginx jails (added after nginx is running) ---
+[nginx-http-auth]
+enabled = true
+port = http,https
+maxretry = 3
+findtime = 600
+
+[nginx-botsearch]
+enabled = true
+port = http,https
+maxretry = 5
+findtime = 600
+
+[nginx-bad-request]
+enabled = true
+port = http,https
+filter = nginx-4xx
+maxretry = 10
+findtime = 600
+logpath = /var/log/nginx/*.access.log
+EOF
+
+        # Create custom nginx-4xx filter for catching scanners and brute-force
+        cat > /etc/fail2ban/filter.d/nginx-4xx.conf << 'EOF'
+# Fail2Ban filter for nginx 4xx status codes
+# Catches scanners, brute-force attempts, and path enumeration
+
+[Definition]
+failregex = ^<HOST> -.*"(GET|POST|HEAD|PUT|DELETE|PATCH|OPTIONS)\s+\S+\s+HTTP/\S+" (400|401|403|404|444)
+ignoreregex =
+EOF
+
+        systemctl restart fail2ban || warning "Failed to restart fail2ban with nginx jails"
+        log "Fail2ban nginx jails configured"
+    fi
+
     # Get SSL certificate if enabled
     if [[ "$ENABLE_SSL" == "true" ]]; then
         log "Requesting SSL certificate from Let's Encrypt..."
@@ -1950,8 +1994,10 @@ SSLEOF
                 fi
 
                 # Include snippet in the SSL server block if not already present
+                # Use 0, address to insert only after the first match (certbot may add multiple listen 443 lines)
                 if ! grep -q "ssl-hardening.conf" /etc/nginx/sites-available/default; then
-                    sed -i '/listen.*443.*ssl/a \    include /etc/nginx/snippets/ssl-hardening.conf;' /etc/nginx/sites-available/default
+                    sed -i '0,/listen.*443.*ssl/{/listen.*443.*ssl/a \    include /etc/nginx/snippets/ssl-hardening.conf;
+                    }' /etc/nginx/sites-available/default
                 fi
 
                 # Test and restart
