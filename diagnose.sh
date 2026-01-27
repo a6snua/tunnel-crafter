@@ -222,20 +222,31 @@ check_wireguard_configuration() {
             fail "Address missing in config"
         fi
 
-        # CRITICAL: Check for PostUp/PostDown rules (NAT configuration)
+        # Check for PostUp/PostDown rules (one of two valid NAT approaches)
+        # NAT can be configured via PostUp/PostDown in wg0.conf OR via UFW before.rules.
+        # Both are valid; only report as informational.
         if grep -q "^PostUp" /etc/wireguard/wg0.conf; then
-            pass "PostUp rules present in config"
+            pass "PostUp rules present in config (NAT via wg0.conf)"
             grep "^PostUp" /etc/wireguard/wg0.conf | while read -r line; do
                 info "  $line"
             done
         else
-            fail "PostUp rules MISSING in config" "NAT/masquerading not configured - this is why traffic doesn't work!"
+            # Not an error — NAT may be handled by UFW before.rules instead
+            if grep -q "WIREGUARD NAT RULES" /etc/ufw/before.rules 2>/dev/null; then
+                pass "NAT managed via UFW before.rules (no PostUp needed)"
+            else
+                fail "NAT not configured" "No PostUp rules in wg0.conf and no WireGuard NAT block in /etc/ufw/before.rules"
+            fi
         fi
 
         if grep -q "^PostDown" /etc/wireguard/wg0.conf; then
             pass "PostDown rules present in config"
         else
-            fail "PostDown rules MISSING in config" "Cleanup rules not configured"
+            if grep -q "WIREGUARD NAT RULES" /etc/ufw/before.rules 2>/dev/null; then
+                info "PostDown not needed — NAT is persistent via UFW before.rules"
+            else
+                warn "PostDown rules missing" "Cleanup rules not configured (only matters if using PostUp NAT)"
+            fi
         fi
 
         # Check for SaveConfig
@@ -448,12 +459,28 @@ check_nat_masquerading() {
     # Check iptables for NAT rules
     local nat_rules_found=false
 
-    # Check for MASQUERADE rule
-    if iptables -t nat -L POSTROUTING -v -n 2>/dev/null | grep -q "MASQUERADE.*wg0"; then
-        pass "iptables MASQUERADE rule found for wg0"
+    # Derive WireGuard subnet from wg0.conf Address (e.g., 10.10.10.1/24 -> 10.10.10.0/24)
+    local wg_subnet=""
+    if [[ -f /etc/wireguard/wg0.conf ]]; then
+        local wg_addr
+        wg_addr=$(grep "^Address" /etc/wireguard/wg0.conf 2>/dev/null | awk -F'= ' '{print $2}' | head -n1)
+        if [[ -n "$wg_addr" ]]; then
+            local wg_ip="${wg_addr%/*}"
+            wg_subnet="${wg_ip%.*}.0/24"
+        fi
+    fi
+    [[ -z "$wg_subnet" ]] && wg_subnet="10.10.10.0/24"
+
+    # Check for MASQUERADE rule matching the WireGuard subnet
+    # NAT may be configured via PostUp (wg0 in the rule) or UFW before.rules (subnet in the rule)
+    if iptables -t nat -L POSTROUTING -v -n 2>/dev/null | grep -q "$wg_subnet"; then
+        pass "iptables MASQUERADE rule found for WireGuard subnet ($wg_subnet)"
+        nat_rules_found=true
+    elif iptables -t nat -L POSTROUTING -v -n 2>/dev/null | grep -q "MASQUERADE.*wg0"; then
+        pass "iptables MASQUERADE rule found for wg0 interface"
         nat_rules_found=true
     else
-        fail "iptables MASQUERADE rule NOT found for wg0" "VPN traffic cannot reach the internet!"
+        fail "iptables MASQUERADE rule NOT found for WireGuard" "No NAT rule for $wg_subnet or wg0 — VPN traffic cannot reach the internet!"
     fi
 
     # Show current NAT table
@@ -497,17 +524,21 @@ check_nat_masquerading() {
         echo ""
         echo -e "${YELLOW}This is the most likely cause of your connectivity issue!${NC}"
         echo ""
-        echo -e "${CYAN}To fix, add these lines to /etc/wireguard/wg0.conf:${NC}"
+        echo -e "${CYAN}Option A — UFW before.rules (persistent, used by tc.sh):${NC}"
+        echo -e "  Add a *nat block to /etc/ufw/before.rules with:"
+        echo -e "  ${CYAN}-A POSTROUTING -s ${wg_subnet} -o ${default_iface} -j MASQUERADE${NC}"
+        echo -e "  Then reload: ${CYAN}ufw reload${NC}"
         echo ""
-        echo -e "PostUp = iptables -A FORWARD -i wg0 -j ACCEPT"
-        echo -e "PostUp = iptables -A FORWARD -o wg0 -j ACCEPT"
-        echo -e "PostUp = iptables -t nat -A POSTROUTING -o $default_iface -j MASQUERADE"
-        echo -e "PostDown = iptables -D FORWARD -i wg0 -j ACCEPT"
-        echo -e "PostDown = iptables -D FORWARD -o wg0 -j ACCEPT"
-        echo -e "PostDown = iptables -t nat -D POSTROUTING -o $default_iface -j MASQUERADE"
+        echo -e "${CYAN}Option B — PostUp/PostDown in wg0.conf:${NC}"
+        echo -e "  PostUp = iptables -A FORWARD -i wg0 -j ACCEPT"
+        echo -e "  PostUp = iptables -A FORWARD -o wg0 -j ACCEPT"
+        echo -e "  PostUp = iptables -t nat -A POSTROUTING -s ${wg_subnet} -o $default_iface -j MASQUERADE"
+        echo -e "  PostDown = iptables -D FORWARD -i wg0 -j ACCEPT"
+        echo -e "  PostDown = iptables -D FORWARD -o wg0 -j ACCEPT"
+        echo -e "  PostDown = iptables -t nat -D POSTROUTING -s ${wg_subnet} -o $default_iface -j MASQUERADE"
+        echo -e "  Then restart: ${CYAN}systemctl restart wg-quick@wg0${NC}"
         echo ""
-        echo -e "${CYAN}Then restart WireGuard:${NC}"
-        echo -e "  systemctl restart wg-quick@wg0"
+        echo -e "${YELLOW}Do NOT use both options — that creates duplicate NAT rules.${NC}"
         echo ""
     fi
 }
@@ -964,24 +995,39 @@ show_summary() {
     echo -e "${BOLD}${BLUE}Recommendations:${NC}"
     echo ""
 
-    # Check for the most common issue
-    if ! grep -q "^PostUp" /etc/wireguard/wg0.conf 2>/dev/null; then
+    # Check for NAT — only flag if neither approach is configured
+    local has_nat=false
+    if grep -q "^PostUp" /etc/wireguard/wg0.conf 2>/dev/null; then
+        has_nat=true
+    elif grep -q "WIREGUARD NAT RULES" /etc/ufw/before.rules 2>/dev/null; then
+        has_nat=true
+    fi
+
+    if [[ "$has_nat" == "false" ]]; then
         echo -e "${RED}1. FIX NAT/MASQUERADING (CRITICAL):${NC}"
-        echo -e "   Your WireGuard config is missing NAT rules. This is why clients"
-        echo -e "   can connect but have no traffic. Add these lines to /etc/wireguard/wg0.conf:"
+        echo -e "   NAT is not configured. Clients can connect but have no internet."
+        echo -e "   Configure NAT using ONE of these two options:"
         echo ""
 
-        local default_iface=$(ip -o -4 route show to default 2>/dev/null | awk '{print $5; exit}')
+        local default_iface
+        default_iface=$(ip -o -4 route show to default 2>/dev/null | awk '{print $5; exit}')
         [[ -z "$default_iface" ]] && default_iface="eth0"
 
-        echo -e "   ${CYAN}PostUp = iptables -A FORWARD -i wg0 -j ACCEPT${NC}"
-        echo -e "   ${CYAN}PostUp = iptables -A FORWARD -o wg0 -j ACCEPT${NC}"
-        echo -e "   ${CYAN}PostUp = iptables -t nat -A POSTROUTING -o $default_iface -j MASQUERADE${NC}"
-        echo -e "   ${CYAN}PostDown = iptables -D FORWARD -i wg0 -j ACCEPT${NC}"
-        echo -e "   ${CYAN}PostDown = iptables -D FORWARD -o wg0 -j ACCEPT${NC}"
-        echo -e "   ${CYAN}PostDown = iptables -t nat -D POSTROUTING -o $default_iface -j MASQUERADE${NC}"
+        local wg_addr
+        wg_addr=$(grep "^Address" /etc/wireguard/wg0.conf 2>/dev/null | awk -F'= ' '{print $2}' | head -n1)
+        local wg_subnet="${wg_addr:+${wg_addr%.*}.0/24}"
+        [[ -z "$wg_subnet" ]] && wg_subnet="10.10.10.0/24"
+
+        echo -e "   ${CYAN}Option A — UFW before.rules (persistent):${NC}"
+        echo -e "   Add a *nat block to /etc/ufw/before.rules with:"
+        echo -e "   ${CYAN}-A POSTROUTING -s ${wg_subnet} -o ${default_iface} -j MASQUERADE${NC}"
+        echo -e "   Then reload: ${CYAN}ufw reload${NC}"
         echo ""
-        echo -e "   Then restart WireGuard: ${CYAN}systemctl restart wg-quick@wg0${NC}"
+        echo -e "   ${CYAN}Option B — PostUp/PostDown in wg0.conf:${NC}"
+        echo -e "   ${CYAN}PostUp = iptables -t nat -A POSTROUTING -s ${wg_subnet} -o $default_iface -j MASQUERADE${NC}"
+        echo -e "   ${CYAN}PostDown = iptables -t nat -D POSTROUTING -s ${wg_subnet} -o $default_iface -j MASQUERADE${NC}"
+        echo ""
+        echo -e "   ${YELLOW}Do NOT use both — that creates duplicate NAT rules.${NC}"
         echo ""
     fi
 
