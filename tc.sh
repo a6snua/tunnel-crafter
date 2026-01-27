@@ -864,6 +864,9 @@ harden_sysctl() {
     if [[ "$DRY_RUN" == "false" ]]; then
         cat > /etc/sysctl.d/99-security.conf << 'EOF'
 # IP Spoofing protection
+# Note: rp_filter=1 (strict) works for simple single-interface WireGuard setups.
+# For multi-homed servers or asymmetric routing, change to rp_filter=2 (loose).
+# The effective value per-interface is max(conf.all, conf.INTERFACE).
 net.ipv4.conf.all.rp_filter = 1
 net.ipv4.conf.default.rp_filter = 1
 
@@ -1275,8 +1278,13 @@ configure_ufw_for_wireguard() {
 
             # Remove any existing incomplete WireGuard NAT rules first
             if grep -q "START WIREGUARD NAT RULES" /etc/ufw/before.rules 2>/dev/null; then
-                log "Removing existing incomplete WireGuard NAT rules..."
-                sed -i '/# START WIREGUARD NAT RULES/,/# END WIREGUARD NAT RULES/d' /etc/ufw/before.rules
+                if grep -q "END WIREGUARD NAT RULES" /etc/ufw/before.rules 2>/dev/null; then
+                    log "Removing existing WireGuard NAT rules..."
+                    sed -i '/# START WIREGUARD NAT RULES/,/# END WIREGUARD NAT RULES/d' /etc/ufw/before.rules
+                else
+                    warning "Found START marker without END marker in before.rules — skipping removal to avoid data loss"
+                    warning "Manually inspect /etc/ufw/before.rules and restore from backup if needed"
+                fi
             fi
 
             # Create temporary files securely
@@ -1298,7 +1306,7 @@ UEOF
             cat "$tmp_wg_rules" /etc/ufw/before.rules > "$tmp_before_new"
             mv "$tmp_before_new" /etc/ufw/before.rules
             chmod 640 /etc/ufw/before.rules
-            rm -f "$tmp_wg_rules" "$tmp_before_new"
+            rm -f "$tmp_wg_rules"
 
             log "UFW NAT rules added for WireGuard (network: ${wg_network}, interface: ${default_interface})"
         else
@@ -1319,6 +1327,7 @@ install_wireguard() {
     # Create WireGuard directory structure
     exec_cmd mkdir -p /etc/wireguard/clients
     exec_cmd chmod 700 /etc/wireguard
+    exec_cmd chmod 700 /etc/wireguard/clients
 
     # Determine default network interface with validation
     local default_interface
@@ -1405,6 +1414,7 @@ Address = ${WG_SERVER_IP}
 ListenPort = ${WG_PORT}
 PrivateKey = ${server_private_key}
 EOF
+            chmod 600 /etc/wireguard/wg0.conf
         fi
 
         # Generate first client configuration
@@ -1439,6 +1449,7 @@ Endpoint = ${PUBLIC_IP}:${WG_PORT}
 AllowedIPs = 0.0.0.0/0
 PersistentKeepalive = 25
 EOF
+            chmod 600 /etc/wireguard/clients/client1.conf
 
             # Add client peer to server configuration
             cat >> /etc/wireguard/wg0.conf << EOF
@@ -1507,11 +1518,13 @@ verify_wireguard() {
 
     log "IP forwarding: ENABLED"
 
-    # Check NAT rules
-    if iptables -t nat -L POSTROUTING -n | grep -q MASQUERADE; then
-        log "NAT masquerading: CONFIGURED"
+    # Check NAT rules for WireGuard subnet specifically
+    local wg_host_ip="${WG_SERVER_IP%/*}"
+    local wg_network="${wg_host_ip%.*}.0/24"
+    if iptables -t nat -L POSTROUTING -n 2>/dev/null | grep -q "$wg_network"; then
+        log "NAT masquerading: CONFIGURED (for $wg_network)"
     else
-        warning "NAT masquerading not found in iptables - VPN may not work"
+        warning "NAT masquerading for $wg_network not found in iptables - VPN clients may not reach the internet"
     fi
 
     # Show WireGuard status
@@ -1737,7 +1750,7 @@ configure_nginx() {
 
             # Generate Apache MD5 hash (nginx auth_basic does not support SHA-512 crypt)
             local password_hash
-            password_hash=$(openssl passwd -apr1 "$netdata_password")
+            password_hash=$(printf '%s' "$netdata_password" | openssl passwd -apr1 -stdin)
             echo "$USER_ACCOUNT_NAME:$password_hash" > /etc/nginx/.htpasswd || error "Failed to create htpasswd file"
             chmod 640 /etc/nginx/.htpasswd
 
@@ -1932,6 +1945,14 @@ create_credentials() {
             protocol="https"
         fi
 
+        # Detect actual SSH password auth state from the live config
+        local pw_auth_status="Disabled"
+        local pw_auth_note="Only SSH key authentication is allowed. Password authentication is DISABLED for security."
+        if grep -q "^PasswordAuthentication yes" /etc/ssh/sshd_config 2>/dev/null; then
+            pw_auth_status="ENABLED (no SSH key installed)"
+            pw_auth_note="Password authentication is ENABLED. Install an SSH key and re-run to disable it."
+        fi
+
         cat > /root/vpn_credentials/vpn_info.txt << EOF
 ========================================================
 VPS SECURITY & WIREGUARD SETUP INFORMATION
@@ -1948,8 +1969,7 @@ SSH Port: ${SSH_PORT}
 Username: ${USER_ACCOUNT_NAME}
 SSH Key: $(if [[ -n "${SSH_PUBLIC_KEY}" ]]; then echo "Installed"; else echo "Not configured"; fi)
 
-IMPORTANT: Only SSH key authentication is allowed.
-Password authentication is DISABLED for security.
+IMPORTANT: ${pw_auth_note}
 
 --------------------------------------------------------
 WIREGUARD VPN SERVER
@@ -1995,7 +2015,7 @@ SECURITY INFORMATION
 Firewall: UFW enabled
 Intrusion Prevention: Fail2Ban active
 SSH Root Login: Key-only (no password)
-Password Auth: Disabled
+Password Auth: ${pw_auth_status}
 Auto Updates: Enabled (daily security patches)
 Auto Reboot: Enabled (02:00 if needed for updates)
 
